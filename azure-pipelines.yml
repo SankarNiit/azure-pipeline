@@ -1,19 +1,2442 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
-
+parameters:
+- name: devops_package_version
+  displayName: DevOps package version
+  type: string
+  default: $(DEVOPS_LATEST_PACKAGE)
 trigger:
-- master
+  branches:
+    include:
+    - master
+    - feature/*
+    - release/*
+  paths:
+    include:
+    - build/azDevOps/azure/premises-api.yaml
+    - deploy/helm/premises-api/*
+    - service/Dockerfile.API
+    - service/Peabody.Premises.API/*
+    - service/Peabody.Premises.API.ComponentTests/*
+    - service/Peabody.Premises.ACL.Vantage/*
+    - service/Peabody.Premises.ACL.Dynamics.UnitTests/*
+    - service/Peabody.Premises.ApplicationServices/*
+    - service/Peabody.Premises.ApplicationServices.UnitTests/*
+    - service/Peabody.Premises.Domain/*
+    - service/Peabody.Premises.Domain.UnitTests/*
+    - service/Peabody.Premises.Infrastructure/*
+    - service/Peabody.Premises.Infrastructure.IntegrationTests/*
+    - service/Peabody.Premises.Infrastructure.UnitTests/*
+    - service/owasp-dependency-check-suppressions.xml
+    - tests/Functional/*
+resources:
+  repositories:
+  - repository: templates
+    type: git
+    name: pipeline-templates
+    ref: master
+  containers:
+  - container: terraform_azure_agent
+    image: pbuksuasacr.azurecr.io/azure-terraform-agent:tf0.12.17_az2.0.75_sops3.4.0
+    endpoint: pbuksuasacr-service-connection
+variables:
+- group: ergo-global
+- group: ergo-provisioning
+- group: ergo-version
+- name: Version.Major
+  value: 1
+- name: Version.Minor
+  value: 8
+- name: Version.Patch
+  value: $[counter(join(variables['Version.Major'], join('-', variables['Version.Minor'])), 0)]
+- name: Version.Semantic
+  value: $(Version.Major).$(Version.Minor).$(Version.Patch)
+- name: Test.UnitTestProjects
+  value: >
+    $(Build.SourcesDirectory)/service/**/*Premises.API*/*UnitTests.csproj
 
-pool:
-  vmImage: ubuntu-latest
+    $(Build.SourcesDirectory)/service/**/*Premises.ACL*/*UnitTests.csproj
 
-steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
+    $(Build.SourcesDirectory)/service/**/*Premises.ApplicationServices*/*UnitTests.csproj
 
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
+    $(Build.SourcesDirectory)/service/**/*Premises.Domain*/*UnitTests.csproj
+
+    $(Build.SourcesDirectory)/service/**/*Premises.Infrastructure*/*UnitTests.csproj
+- name: Test.ComponentTestProjects
+  value: $(Build.SourcesDirectory)/service/**/*Premises.API*/*ComponentTests.csproj
+- name: Test.IntegrationTestProjects
+  value: $(Build.SourcesDirectory)/service/**/*Premises.Infrastructure*/*IntegrationTests.csproj
+- name: Test.IntegrationTestAppSetingsFile
+  value: $(Build.SourcesDirectory)/service/Peabody.Premises.Infrastructure.IntegrationTests/appsettings.json
+- name: Test.FunctionalTestProject
+  value: '**/Peabody.Premises.API.FunctionalTests.csproj'
+- name: Test.FunctionalTestAppSetingsFile
+  value: Functional/Peabody.Premises.API.FunctionalTests/appsettings.json
+- name: Test.FunctionalTestNugetPath
+  value: Functional/NuGet.config
+- name: Test.FunctionalTestReportStorageAccountRG
+  value: pb-uks-np-ergo-rg-aks
+- name: Test.FunctionalTestReportStorageAccountName
+  value: pbuksnpergosainfra
+- name: Test.FunctionalTestReportStorageContainerName
+  value: testresults
+- name: Test.FunctionalTestReportTargetName
+  value: premises-api-$(Version.BuildMetadata)
+- name: Test.FunctionalTestReportSourcePath
+  value: $(Agent.TempDirectory)/_fv-*.trx
+- name: BuildConfiguration
+  value: Release
+- name: Docker.WorkDir
+  value: $(Build.SourcesDirectory)/service
+- name: Docker.API.Imagename
+  value: premises-api
+- name: Docker.API.Dockerfile
+  value: $(Build.SourcesDirectory)/service/Dockerfile.API
+- name: DevOps.File
+  value: $(DEVOPS_LATEST_PACKAGE)
+stages:
+- stage: BuildTestFeatureBranch
+  condition: startsWith(variables['Build.SourceBranch'], 'refs/heads/feature/')
+  dependsOn: []
+  variables:
+  - group: ergo-subscription-nonprod
+  jobs:
+  - job: GetPackage
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: Bash@3
+      displayName: 'Get Package: DevOps'
+      env:
+        azure_client_id: $(ARM_CLIENT_ID)
+        azure_client_secret: $(ARM_CLIENT_SECRET)
+        azure_subscription_id: $(ARM_SUBSCRIPTION_ID)
+        azure_tenant_id: $(ARM_TENANT_ID)
+      inputs:
+        targetType: inline
+        script: >
+          az login --service-principal --username $azure_client_id --password $azure_client_secret --tenant $azure_tenant_id
+
+          #az account set -s $azure_subscription_id
+
+          ACCOUNT_KEY=$( az storage account keys list -g $(DevOps.RG) -n $(DevOps.storageAccount) --query '[1].value' )
+
+          SAS_KEY_EXPIRY=$( date -d "1 month" '+%Y-%m-%dT%H:%MZ' )
+
+          SAS_KEY=$( az storage account generate-sas --permissions lr --account-name $(DevOps.storageAccount) --account-key $ACCOUNT_KEY --services b --resource-types sco --expiry $SAS_KEY_EXPIRY -otsv )
+
+          SAS_KEY=$( sed -e 's/^"//' -e 's/"$//' <<<"$SAS_KEY" )
+
+          BLOB_URL=$( az storage blob url --account-name $(DevOps.storageAccount) --account-key $ACCOUNT_KEY --container-name $(DevOps.Container) --name $(DevOps.File) )
+
+          BLOB_URL=$( sed -e 's/^"//' -e 's/"$//' <<<"$BLOB_URL" )
+
+          wget -O $(Build.BinariesDirectory)/$(DevOps.File) $BLOB_URL?$SAS_KEY
+
+          az logout --username $azure_client_id
+        workingDirectory: $(Build.BinariesDirectory)
+    - task: ExtractFiles@1
+      inputs:
+        archiveFilePatterns: $(Build.BinariesDirectory)/$(DevOps.File)
+        destinationFolder: $(Build.BinariesDirectory)/DevOps
+      displayName: 'Extract Package: DevOps'
+    - task: ecdc45f6-832d-4ad9-b52b-ee49e94659be@1
+      inputs:
+        path: $(Build.BinariesDirectory)/DevOps
+        artifactName: DevOps
+  - job: BuildDotNet
+    dependsOn:
+    - GetPackage
+    pool:
+      vmImage: ubuntu-16.04
+    continueOnError: false
+    steps:
+    - task: Bash@3
+      displayName: Set Version Variables
+      inputs:
+        targetType: inline
+        script: >
+          commitSHA=$(Build.SourceVersion)
+
+          branch=$(Build.SourceBranchName)
+
+          buildMetadata=$(Build.BuildId).${commitSHA:0:7}
+
+          SemVer=$(Version.Semantic)
+
+          echo "##vso[task.setvariable variable=Version.BuildMetadata;]${buildMetadata}"
+
+          echo "##vso[task.setvariable variable=Version.ReleaseMetadata;]rc.${buildMetadata}"
+
+          echo "##vso[task.setvariable variable=Version.ReleaseCandidate;]${branch}-rc.${buildMetadata}"
+
+          echo "Build Number: ${SemVer}-${branch}"
+
+          echo "##vso[build.updatebuildnumber]${SemVer}-${branch}"
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: Download DevOps Artefacts
+      inputs:
+        alias: current
+        artifact: DevOps
+    - task: Bash@3
+      displayName: 'Install: DevOps Tools'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Bootstrap/install-cicd-prereqs.sh
+        arguments: $(System.DefaultWorkingDirectory)/kustomize https://github.com/kubernetes-sigs/kustomize/releases/download/v2.0.3/kustomize_2.0.3_linux_amd64
+    - task: Bash@3
+      displayName: 'Login: Azure'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/set-azure-context.sh
+        arguments: $(ARM_TENANT_ID) $(ARM_SUBSCRIPTION_ID) $(ARM_CLIENT_ID) $(ARM_CLIENT_SECRET)
+        failOnStderr: true
+    - task: NuGetCommand@2
+      displayName: Authenticate NuGet Packages Feed
+      inputs:
+        command: custom
+        arguments: sources update -Name "Azure DevOps" -Username "vsts" -Password "$(System.AccessToken)" -StorePasswordInClearText -ConfigFile ./service/NuGet.config
+        workingDirectory: ''
+    - task: UseDotNet@2
+      displayName: Install DOTNET 3.1
+      inputs:
+        packageType: sdk
+        version: 3.1.100
+        installationPath: $(Agent.ToolsDirectory)/dotnet
+    - task: DotNetCoreCLI@2
+      displayName: 'Test: Unit Tests'
+      inputs:
+        command: test
+        projects: $(Test.UnitTestProjects)
+        arguments: --configuration $(BuildConfiguration) /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura
+        testRunTitle: Unit Tests
+        failOnStderr: true
+    - task: DotNetCoreCLI@2
+      displayName: 'Test: Component Tests'
+      inputs:
+        command: test
+        projects: $(Test.ComponentTestProjects)
+        arguments: /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura
+        testRunTitle: Component Tests
+        failOnStderr: true
+    - task: Palmmedia.reportgenerator.reportgenerator-build-release-task.reportgenerator@4
+      displayName: ReportGenerator
+      inputs:
+        reports: $(Build.SourcesDirectory)/service/Peabody.*/coverage.cobertura.xml
+        targetdir: $(Build.SourcesDirectory)/CodeCoverage
+        reporttypes: HtmlInline_AzurePipelines;Cobertura;Badges
+        assemblyfilters: -xunit.*;-Pipelines.*;-StackExchange.*;-FluentValidation*
+    - task: PublishCodeCoverageResults@1
+      displayName: Publish code coverage
+      inputs:
+        codeCoverageTool: Cobertura
+        summaryFileLocation: $(Build.SourcesDirectory)/CodeCoverage/Cobertura.xml
+        reportDirectory: $(Build.SourcesDirectory)/CodeCoverage
+        failOnStderr: true
+    - task: UniversalPackages@0
+      displayName: ODC CLI and Data Package Download
+      inputs:
+        command: download
+        vstsFeed: $(AzureDevOps.Organisation)
+        vstsFeedPackage: owasp-dependency-check-cli
+        vstsPackageVersion: 6.*
+        downloadDirectory: $(Build.SourcesDirectory)/dependency-check
+    - task: Bash@3
+      displayName: ODC CLI Scanning
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Dependency-check/dependency-scan.sh
+        arguments: >
+          '$(Build.SourcesDirectory)/service' '**/*.csproj' '$(Agent.TempDirectory)/dependency-scan-results' 'ALL' 'BE' '' '7' '$(Build.SourcesDirectory)/service/owasp-dependency-check-suppressions.xml'
+        workingDirectory: $(Build.SourcesDirectory)
+      continueOnError: true
+    - task: PublishTestResults@2
+      condition: succeededOrFailed()
+      displayName: Publish ODC Results
+      inputs:
+        testResultsFormat: JUnit
+        testResultsFiles: $(Agent.TempDirectory)/dependency-scan-results/dependency-check-junit.xml
+        testRunTitle: Dependency Scan
+    - task: PublishPipelineArtifact@1
+      condition: succeededOrFailed()
+      displayName: Publish ODC Artifacts
+      inputs:
+        targetPath: $(Agent.TempDirectory)/dependency-scan-results
+        artifactName: dependency-check-$(System.JobAttempt)
+- stage: BuildTestPR
+  condition: eq(variables['Build.Reason'], 'PullRequest')
+  dependsOn: []
+  variables:
+  - group: ergo-subscription-nonprod
+  - group: core-subscription-nonprod
+  - group: services-secrets-dev
+  - group: search-dev
+  - group: drools-dev
+  jobs:
+  - job: GetPackage
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: Bash@3
+      displayName: 'Get Package: DevOps'
+      env:
+        azure_client_id: $(ARM_CLIENT_ID)
+        azure_client_secret: $(ARM_CLIENT_SECRET)
+        azure_subscription_id: $(ARM_SUBSCRIPTION_ID)
+        azure_tenant_id: $(ARM_TENANT_ID)
+      inputs:
+        targetType: inline
+        script: >
+          az login --service-principal --username $azure_client_id --password $azure_client_secret --tenant $azure_tenant_id
+
+          #az account set -s $azure_subscription_id
+
+          ACCOUNT_KEY=$( az storage account keys list -g $(DevOps.RG) -n $(DevOps.storageAccount) --query '[1].value' )
+
+          SAS_KEY_EXPIRY=$( date -d "1 month" '+%Y-%m-%dT%H:%MZ' )
+
+          SAS_KEY=$( az storage account generate-sas --permissions lr --account-name $(DevOps.storageAccount) --account-key $ACCOUNT_KEY --services b --resource-types sco --expiry $SAS_KEY_EXPIRY -otsv )
+
+          SAS_KEY=$( sed -e 's/^"//' -e 's/"$//' <<<"$SAS_KEY" )
+
+          BLOB_URL=$( az storage blob url --account-name $(DevOps.storageAccount) --account-key $ACCOUNT_KEY --container-name $(DevOps.Container) --name $(DevOps.File) )
+
+          BLOB_URL=$( sed -e 's/^"//' -e 's/"$//' <<<"$BLOB_URL" )
+
+          wget -O $(Build.BinariesDirectory)/$(DevOps.File) $BLOB_URL?$SAS_KEY
+
+          az logout --username $azure_client_id
+        workingDirectory: $(Build.BinariesDirectory)
+    - task: ExtractFiles@1
+      inputs:
+        archiveFilePatterns: $(Build.BinariesDirectory)/$(DevOps.File)
+        destinationFolder: $(Build.BinariesDirectory)/DevOps
+      displayName: 'Extract Package: DevOps'
+    - task: ecdc45f6-832d-4ad9-b52b-ee49e94659be@1
+      inputs:
+        path: $(Build.BinariesDirectory)/DevOps
+        artifactName: DevOps
+  - job: PublishDeployArtifact
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: ecdc45f6-832d-4ad9-b52b-ee49e94659be@1
+      inputs:
+        path: $(Build.SourcesDirectory)/deploy
+        artifactName: deploy
+  - job: BuildDotNet
+    dependsOn:
+    - GetPackage
+    - PublishDeployArtifact
+    pool:
+      vmImage: ubuntu-16.04
+    continueOnError: false
+    steps:
+    - task: Bash@3
+      displayName: Set Version Variables
+      inputs:
+        targetType: inline
+        script: >
+          commitSHA=$(Build.SourceVersion)
+
+          branch=$(Build.SourceBranchName)
+
+          buildMetadata=$(Build.BuildId).${commitSHA:0:7}
+
+          SemVer=$(Version.Semantic)
+
+          echo "##vso[task.setvariable variable=Version.BuildMetadata;]${buildMetadata}"
+
+          echo "##vso[task.setvariable variable=Version.ReleaseMetadata;]rc.${buildMetadata}"
+
+          echo "##vso[task.setvariable variable=Version.ReleaseCandidate;]${branch}-rc.${buildMetadata}"
+
+          echo "Build Number: ${SemVer}-${branch}"
+
+          echo "##vso[build.updatebuildnumber]${SemVer}-${branch}"
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: Download DevOps Artefacts
+      inputs:
+        alias: current
+        artifact: DevOps
+    - task: Bash@3
+      displayName: 'Install: DevOps Tools'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Bootstrap/install-cicd-prereqs.sh
+        arguments: $(System.DefaultWorkingDirectory)/kustomize https://github.com/kubernetes-sigs/kustomize/releases/download/v2.0.3/kustomize_2.0.3_linux_amd64
+    - task: Bash@3
+      displayName: 'Login: Azure'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/set-azure-context.sh
+        arguments: $(ARM_TENANT_ID) $(ARM_SUBSCRIPTION_ID) $(ARM_CLIENT_ID) $(ARM_CLIENT_SECRET)
+        failOnStderr: true
+    - task: NuGetCommand@2
+      displayName: Authenticate NuGet Packages Feed
+      inputs:
+        command: custom
+        arguments: sources update -Name "Azure DevOps" -Username "vsts" -Password "$(System.AccessToken)" -StorePasswordInClearText -ConfigFile ./service/NuGet.config
+        workingDirectory: ''
+    - task: UseDotNet@2
+      displayName: Install DOTNET 3.1
+      inputs:
+        packageType: sdk
+        version: 3.1.100
+        installationPath: $(Agent.ToolsDirectory)/dotnet
+    - task: DotNetCoreCLI@2
+      displayName: 'Test: Unit Tests'
+      inputs:
+        command: test
+        projects: $(Test.UnitTestProjects)
+        arguments: --configuration $(BuildConfiguration) /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura
+        testRunTitle: Unit Tests
+        failOnStderr: true
+    - task: DotNetCoreCLI@2
+      displayName: 'Test: Component Tests'
+      inputs:
+        command: test
+        projects: $(Test.ComponentTestProjects)
+        arguments: /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura
+        testRunTitle: Component Tests
+        failOnStderr: true
+    - task: Bash@3
+      displayName: Replace tokens
+      inputs:
+        filePath: $(Pipeline.Workspace)/DevOps/AzureDevOps/replace-tokens.sh
+        arguments: "'$(Test.IntegrationTestAppSetingsFile)'"
+      env:
+        DYNAMICSAZUREAD_TOKENENDPOINT: $(DYNAMICSAZUREAD_TOKENENDPOINT)
+        DYNAMICSAZUREAD_RESOURCE: $(DYNAMICSAZUREAD_RESOURCE)
+        DYNAMICS_URL: $(DYNAMICS_URL)
+        DYNAMICSAZUREAD_CLIENTID: $(DYNAMICSAZUREAD_CLIENTID)
+        DYNAMICSAZUREAD_CRMUSERNAME: $(DYNAMICSAZUREAD_CRMUSERNAME)
+        DYNAMICSAZUREAD_CRMPASSWORD: $(DYNAMICSAZUREAD_CRMPASSWORD)
+        DYNAMICSTESTDATA_PREMISESID: BBF0FACB-7A71-E811-80DE-0050569540E1
+        DYNAMICSAZUREAD_CACHETIMEINMINUTES: 15
+        PREMISESGATEWAYAPICONFIGURATION_RETRYCOUNT: 1
+        PREMISESGATEWAYAPICONFIGURATION_TIMEOUTSECONDS: 60
+        SEARCH_PRIMARY_KEY: $(SEARCH_PRIMARY_KEY)
+        SEARCH_SERVICE_NAME: $(SEARCH_NAME)
+        DROOLS_ENDPOINT: $(DROOLS_ENDPOINT)
+        DROOLS_PREMISES_RULE: $(DROOLS_PREMISES_RULE)
+        DROOLS_PREMISES_PACKAGENAME: $(DROOLS_PREMISES_PACKAGENAME)
+        DROOLS_BASIC_AUTH_TOKEN: $(DROOLS_BASIC_AUTH_TOKEN)
+    - task: DotNetCoreCLI@2
+      displayName: 'Test: Integration Tests'
+      inputs:
+        command: test
+        projects: $(Test.IntegrationTestProjects)
+        arguments: --configuration $(BuildConfiguration) /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura
+        testRunTitle: Integration Tests
+        failOnStderr: true
+    - task: Palmmedia.reportgenerator.reportgenerator-build-release-task.reportgenerator@4
+      displayName: ReportGenerator
+      inputs:
+        reports: $(Build.SourcesDirectory)/service/Peabody.*/coverage.cobertura.xml
+        targetdir: $(Build.SourcesDirectory)/CodeCoverage
+        reporttypes: HtmlInline_AzurePipelines;Cobertura;Badges
+        assemblyfilters: -xunit.*;-Pipelines.*;-StackExchange.*;-FluentValidation*
+    - task: PublishCodeCoverageResults@1
+      displayName: Publish code coverage
+      inputs:
+        codeCoverageTool: Cobertura
+        summaryFileLocation: $(Build.SourcesDirectory)/CodeCoverage/Cobertura.xml
+        reportDirectory: $(Build.SourcesDirectory)/CodeCoverage
+        failOnStderr: true
+    - task: UniversalPackages@0
+      displayName: ODC CLI and Data Package Download
+      inputs:
+        command: download
+        vstsFeed: $(AzureDevOps.Organisation)
+        vstsFeedPackage: owasp-dependency-check-cli
+        vstsPackageVersion: 6.*
+        downloadDirectory: $(Build.SourcesDirectory)/dependency-check
+    - task: Bash@3
+      displayName: ODC CLI Scanning
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Dependency-check/dependency-scan.sh
+        arguments: >
+          '$(Build.SourcesDirectory)/service' '**/*.csproj' '$(Agent.TempDirectory)/dependency-scan-results' 'ALL' 'BE' '' '7' '$(Build.SourcesDirectory)/service/owasp-dependency-check-suppressions.xml'
+        workingDirectory: $(Build.SourcesDirectory)
+      continueOnError: true
+    - task: PublishTestResults@2
+      condition: succeededOrFailed()
+      displayName: Publish ODC Results
+      inputs:
+        testResultsFormat: JUnit
+        testResultsFiles: $(Agent.TempDirectory)/dependency-scan-results/dependency-check-junit.xml
+        testRunTitle: Dependency Scan
+    - task: PublishPipelineArtifact@1
+      condition: succeededOrFailed()
+      displayName: Publish ODC Artifacts
+      inputs:
+        targetPath: $(Agent.TempDirectory)/dependency-scan-results
+        artifactName: dependency-check-$(System.JobAttempt)
+    - task: NuGetCommand@2
+      displayName: Authenticate NuGet Packages Feed
+      inputs:
+        command: custom
+        arguments: sources update -Name "Azure DevOps" -Username "vsts" -Password "$(System.AccessToken)" -StorePasswordInClearText -ConfigFile ./service/NuGet.config
+        workingDirectory: ''
+    - task: Bash@3
+      displayName: Build $(Docker.API.Imagename)
+      inputs:
+        targetType: inline
+        script: >
+          echo "Dockerfile - $(Docker.API.Dockerfile)"
+
+          echo "Image name - $(Docker.API.Imagename)"
+
+          echo "Image tag - $(Version.Semantic)"
+
+          echo "Assembly version - $(Version.Semantic)+$(Version.BuildMetadata)"
+
+          docker build . -f $(Docker.API.Dockerfile)  --build-arg VERSION=$(Version.Semantic)+$(Version.BuildMetadata) \
+            -t $(Docker.API.Imagename):$(Version.Semantic) \
+            -t $(DOCKER_CONTAINER_REGISTRY_URL)/$(Docker.API.Imagename):$(Version.Semantic)
+        workingDirectory: $(Docker.WorkDir)
+    - task: Bash@3
+      displayName: Vulnerability Scan
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Docker/new-image-scan.sh
+        arguments: $(Docker.API.Imagename) $(Version.Semantic) 0.11.0
+        workingDirectory: $(Build.ArtifactStagingDirectory)
+      continueOnError: true
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: $(Build.ArtifactStagingDirectory)/$(Docker.API.Imagename)-$(Version.Semantic)_MEDIUM-HIGH.txt
+        artifactName: $(Docker.API.Imagename)-$(Version.Semantic)_MEDIUM-HIGH.txt-$(System.JobAttempt)
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: $(Build.ArtifactStagingDirectory)/$(Docker.API.Imagename)-$(Version.Semantic)_CRITICAL.txt
+        artifactName: $(Docker.API.Imagename)-$(Version.Semantic)_CRITICAL.txt-$(System.JobAttempt)
+    - task: Bash@3
+      displayName: Push Container Image to Azure Container Registry
+      inputs:
+        targetType: inline
+        script: >
+          az acr login --name $(DOCKER_CONTAINER_REGISTRY_NAME)
+
+          docker push $(DOCKER_CONTAINER_REGISTRY_URL)/$(Docker.API.Imagename)
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish: Functional Tests Artifact'
+      inputs:
+        targetPath: $(Build.SourcesDirectory)/tests
+        artifactName: functional-tests
+- stage: DeployPR
+  dependsOn:
+  - BuildTestPR
+  variables:
+  - group: ergo-subscription-nonprod
+  - group: core-subscription-nonprod
+  - group: services-secrets-dev
+  - group: core-dev
+  - group: search-dev
+  - group: drools-dev
+  - name: Kubernetes.ClusterResourceGroup
+    value: pb-uks-np-ergo-rg-aks
+  - name: Kubernetes.ClusterName
+    value: pb-uks-np-ergo-aks
+  jobs:
+  - deployment: InitDeploy
+    environment:
+      name: premises_dev
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: Bash@3
+            inputs:
+              targetType: inline
+              script: echo "Checking Azure DevOps environment for approvals..."
+  - job: HelmDeploy
+    dependsOn: []
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: Bash@3
+      displayName: Set Version Variables
+      inputs:
+        targetType: inline
+        script: >
+          commitSHA=$(Build.SourceVersion)
+
+          branch=$(Build.SourceBranchName)
+
+          buildMetadata=$(Build.BuildId).${commitSHA:0:7}
+
+          SemVer=$(Version.Semantic)
+
+          echo "##vso[task.setvariable variable=Version.BuildMetadata;]${buildMetadata}"
+
+          echo "##vso[task.setvariable variable=Version.ReleaseMetadata;]rc.${buildMetadata}"
+
+          echo "##vso[task.setvariable variable=Version.ReleaseCandidate;]${branch}-rc.${buildMetadata}"
+
+          echo "Build Number: ${SemVer}-${branch}"
+
+          echo "##vso[build.updatebuildnumber]${SemVer}-${branch}"
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: 'Download: Build Artefacts'
+      inputs:
+        alias: current
+        artifact: deploy
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: 'Download: Test Artefacts'
+      inputs:
+        alias: current
+        artifact: functional-tests
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: Download DevOps Artefacts
+      inputs:
+        alias: current
+        artifact: DevOps
+    - task: Bash@3
+      displayName: 'Install: DevOps Tools'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Bootstrap/install-cicd-prereqs.sh
+        arguments: $(System.DefaultWorkingDirectory)/kustomize https://github.com/kubernetes-sigs/kustomize/releases/download/v2.0.3/kustomize_2.0.3_linux_amd64
+    - task: Bash@3
+      displayName: 'Login: Azure'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/set-azure-context.sh
+        arguments: $(ARM_TENANT_ID) $(ARM_SUBSCRIPTION_ID) $(ARM_CLIENT_ID) $(ARM_CLIENT_SECRET)
+        failOnStderr: true
+    - task: Bash@3
+      displayName: 'Login: Kubernetes'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/set-aks-context.sh
+        arguments: $(Kubernetes.ClusterResourceGroup) $(Kubernetes.ClusterName)
+        failOnStderr: true
+    - task: UniversalPackages@0
+      name: download_az_package
+      displayName: Download AZ 4.7.0
+      inputs:
+        command: download
+        vstsFeed: $(AzureDevOps.Organisation)
+        vstsFeedPackage: pwsh.az.modules
+        vstsPackageVersion: 4.7.0
+        downloadDirectory: $(Agent.TempDirectory)/az
+    - task: PowerShell@2
+      displayName: 'Install: Az'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/install-az-module.ps1
+        arguments: >
+          -localRepository -localModuleDir '$(Agent.TempDirectory)/az'
+        failOnStderr: true
+    - task: PowerShell@2
+      displayName: 'Login: Powershell'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/set-pwsh-az-context.ps1
+        arguments: $(ARM_CLIENT_ID) $(ARM_CLIENT_SECRET) $(ARM_TENANT_ID) $(ARM_SUBSCRIPTION_ID)
+        failOnStderr: true
+    - task: Bash@3
+      displayName: Replace tokens
+      inputs:
+        filePath: $(Pipeline.Workspace)/DevOps/AzureDevOps/replace-tokens.sh
+        arguments: "'$(Pipeline.Workspace)/deploy/helm/premises-api/values.yaml $(Pipeline.Workspace)/deploy/helm/premises-api/Chart.yaml'"
+      env:
+        BUILD_VERSION: $(Version.Semantic)
+        APPLICATION_INSIGHTS_KEY: $(APPLICATION_INSIGHTS_INSTRUMENTATION_KEY)
+        TENANT_ID: $(ARM_TENANT_ID)
+        AZURE_AD_BACKEND_CLIENT_ID: $(azureclientid)
+        DYNAMICSAZUREAD_TOKENENDPOINT: $(DYNAMICSAZUREAD_TOKENENDPOINT)
+        DYNAMICSAZUREAD_RESOURCE: $(DYNAMICSAZUREAD_RESOURCE)
+        DYNAMICSAZUREAD_CLIENTID: $(DYNAMICSAZUREAD_CLIENTID)
+        DYNAMICSAZUREAD_CRMUSERNAME: $(DYNAMICSAZUREAD_CRMUSERNAME)
+        DYNAMICSAZUREAD_CRMPASSWORD: $(DYNAMICSAZUREAD_CRMPASSWORD)
+        DYNAMICS_URL: $(DYNAMICS_URL)
+        DYNAMICSAZUREAD_CACHETIMEINMINUTES: 15
+        PREMISESGATEWAYAPICONFIGURATION_RETRYCOUNT: 1
+        PREMISESGATEWAYAPICONFIGURATION_TIMEOUTSECONDS: 60
+        SEARCH_PRIMARY_KEY: $(SEARCH_PRIMARY_KEY)
+        SEARCH_SERVICE_NAME: $(SEARCH_NAME)
+        LOGLEVEL_DEFAULT: Debug
+        LOGLEVEL_DEFAULT_MICROSOFT: Debug
+        API_POD_REPLICA_COUNT: 1
+        DROOLS_ENDPOINT: $(DROOLS_ENDPOINT)
+        DROOLS_PREMISES_RULE: $(DROOLS_PREMISES_RULE)
+        DROOLS_PREMISES_PACKAGENAME: $(DROOLS_PREMISES_PACKAGENAME)
+        DROOLS_BASIC_AUTH_TOKEN: $(DROOLS_BASIC_AUTH_TOKEN)
+    - task: Bash@3
+      displayName: Helm Lint premises-api-$(ENVIRONMENT)
+      inputs:
+        targetType: inline
+        script: >
+          helm lint ./helm/premises-api
+        workingDirectory: $(Pipeline.Workspace)/deploy
+    - task: Bash@3
+      displayName: upgrade/install premises-api-$(ENVIRONMENT)
+      inputs:
+        filePath: $(Pipeline.Workspace)/DevOps/Helm/helm-upgrade-install.sh
+        workingDirectory: $(Pipeline.Workspace)/deploy
+        arguments: >
+          $(Kubernetes.ClusterName) $(ENVIRONMENT)-premises premises-api-$(ENVIRONMENT) helm/premises-api helm/premises-api/values.yaml $(Version.Semantic)
+    - task: Bash@3
+      displayName: 'Kubectl: get deployment properties'
+      inputs:
+        targetType: inline
+        script: >
+          # Check deployment rollout status every 10 seconds (max 5 minutes) until complete.
+
+          ATTEMPTS=0
+
+          ROLLOUT_STATUS_CMD="kubectl rollout status --namespace=$(ENVIRONMENT)-premises deployments/premises-api-$(ENVIRONMENT)"
+
+          until $ROLLOUT_STATUS_CMD || [ $ATTEMPTS -eq 30 ]; do
+            $ROLLOUT_STATUS_CMD
+            ATTEMPTS=$((attempts + 1))
+            sleep 10
+          done
+
+
+          container=$(kubectl get pods --namespace=$(ENVIRONMENT)-premises --selector=release=premises-api-$(ENVIRONMENT),version=$(Version.Semantic) -o jsonpath='{.items[0].metadata.name}')
+
+          echo "container: $container"
+
+          service=$(kubectl get service --namespace=$(ENVIRONMENT)-premises --selector=release=premises-api-$(ENVIRONMENT) -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}')
+
+          echo "Service IP: $service"
+
+          swagger=$(kubectl exec --namespace=$(ENVIRONMENT)-premises ${container} -- curl -s localhost/swagger/all/swagger.json)
+
+          echo $swagger > premises-api-$(ENVIRONMENT)-swagger.json
+
+          echo "--------- swagger -----------"
+
+          cat premises-api-$(ENVIRONMENT)-swagger.json
+
+          echo "--------- swagger -----------"
+
+          echo "##vso[task.setvariable variable=SERVICE_URL]http://${service}"
+        failOnStderr: true
+        workingDirectory: $(Pipeline.Workspace)
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: $(Pipeline.Workspace)/premises-api-$(ENVIRONMENT)-swagger.json
+        artifactName: premises-api-$(ENVIRONMENT)-swagger-$(System.JobAttempt)
+    - task: PowerShell@2
+      displayName: Update APIM API definition - premises-api-$(ENVIRONMENT)
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/import-apim-api.ps1
+        arguments: >
+          -resourceGroupName $(CORE_RESOURCE_GROUP) -serviceName $(APIM_SERVICE_NAME) -apiId premises-api-$(ENVIRONMENT) -apiPath /premises -specificationPath premises-api-$(ENVIRONMENT)-swagger.json
+        workingDirectory: $(Pipeline.Workspace)
+        failOnStderr: true
+    - task: UseDotNet@2
+      displayName: Use .NET Core SDK 3.1.100
+      inputs:
+        packageType: sdk
+        version: 3.1.100
+        installationPath: $(Agent.ToolsDirectory)/dotnet
+    - task: NuGetCommand@2
+      displayName: Authenticate NuGet Packages Feed
+      inputs:
+        command: custom
+        arguments: sources update -Name "Azure DevOps" -Username "vsts" -Password "$(System.AccessToken)" -StorePasswordInClearText -ConfigFile $(Pipeline.Workspace)/functional-tests/$(Test.FunctionalTestNugetPath)
+        workingDirectory: ''
+    - task: Bash@3
+      displayName: Replace tokens
+      inputs:
+        filePath: $(Pipeline.Workspace)/DevOps/AzureDevOps/replace-tokens.sh
+        arguments: "'$(Pipeline.Workspace)/functional-tests/$(Test.FunctionalTestAppSetingsFile)'"
+      env:
+        BASE_URL: $(APIM_GATEWAY_URL)/premises/
+        OCP_APIM_SUBSCRIPTION_KEY: $(APIM_FULL_ACCESS_PRIMARY_KEY)
+        TENANT_ID: $(ARM_TENANT_ID)
+        AZURE_AD_BACKEND_CLIENT_ID: $(azureclientid)
+        AZURE_AD_CONSUMER_CLIENT_ID: $(WEB_APP_AAD_CLIENT_ID)
+        AZURE_AD_CONSUMER_CLIENT_SECRET: $(WEB_APP_AAD_CLIENT_SECRET)
+        SEARCH_PRIMARY_KEY: $(SEARCH_PRIMARY_KEY)
+        SEARCH_SERVICE_NAME: $(SEARCH_NAME)
+    - task: DotNetCoreCLI@2
+      displayName: 'Test: Run Functional Tests'
+      inputs:
+        command: test
+        projects: $(Pipeline.Workspace)/functional-tests/$(Test.FunctionalTestProject)
+        arguments: '-v n '
+        testRunTitle: Functional Tests
+    - task: Bash@3
+      displayName: 'Upload: Test Results'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/upload-azstorage-blob.sh
+        arguments: $(Test.FunctionalTestReportStorageAccountRG) $(Test.FunctionalTestReportSourcePath) $(Test.FunctionalTestReportStorageAccountName) $(Test.FunctionalTestReportStorageContainerName) $(Test.FunctionalTestReportTargetName)
+    - task: Bash@3
+      displayName: 'Retrieve URL: Test Results'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/get-azstorage-sasurl.sh
+        arguments: $(Test.FunctionalTestReportStorageAccountRG) $(Test.FunctionalTestReportStorageAccountName) $(Test.FunctionalTestReportStorageContainerName) $(Test.FunctionalTestReportTargetName)
+- stage: BuildTestMaster
+  condition: eq(variables['Build.SourceBranch'], 'refs/heads/master')
+  dependsOn: []
+  variables:
+  - group: ergo-subscription-nonprod
+  - group: core-subscription-nonprod
+  - group: services-secrets-test
+  - group: search-test
+  - group: drools-test
+  jobs:
+  - job: GetPackage
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: Bash@3
+      displayName: 'Get Package: DevOps'
+      env:
+        azure_client_id: $(ARM_CLIENT_ID)
+        azure_client_secret: $(ARM_CLIENT_SECRET)
+        azure_subscription_id: $(ARM_SUBSCRIPTION_ID)
+        azure_tenant_id: $(ARM_TENANT_ID)
+      inputs:
+        targetType: inline
+        script: >
+          az login --service-principal --username $azure_client_id --password $azure_client_secret --tenant $azure_tenant_id
+
+          #az account set -s $azure_subscription_id
+
+          ACCOUNT_KEY=$( az storage account keys list -g $(DevOps.RG) -n $(DevOps.storageAccount) --query '[1].value' )
+
+          SAS_KEY_EXPIRY=$( date -d "1 month" '+%Y-%m-%dT%H:%MZ' )
+
+          SAS_KEY=$( az storage account generate-sas --permissions lr --account-name $(DevOps.storageAccount) --account-key $ACCOUNT_KEY --services b --resource-types sco --expiry $SAS_KEY_EXPIRY -otsv )
+
+          SAS_KEY=$( sed -e 's/^"//' -e 's/"$//' <<<"$SAS_KEY" )
+
+          BLOB_URL=$( az storage blob url --account-name $(DevOps.storageAccount) --account-key $ACCOUNT_KEY --container-name $(DevOps.Container) --name $(DevOps.File) )
+
+          BLOB_URL=$( sed -e 's/^"//' -e 's/"$//' <<<"$BLOB_URL" )
+
+          wget -O $(Build.BinariesDirectory)/$(DevOps.File) $BLOB_URL?$SAS_KEY
+
+          az logout --username $azure_client_id
+        workingDirectory: $(Build.BinariesDirectory)
+    - task: ExtractFiles@1
+      inputs:
+        archiveFilePatterns: $(Build.BinariesDirectory)/$(DevOps.File)
+        destinationFolder: $(Build.BinariesDirectory)/DevOps
+      displayName: 'Extract Package: DevOps'
+    - task: ecdc45f6-832d-4ad9-b52b-ee49e94659be@1
+      inputs:
+        path: $(Build.BinariesDirectory)/DevOps
+        artifactName: DevOps
+  - job: PublishDeployArtifact
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: ecdc45f6-832d-4ad9-b52b-ee49e94659be@1
+      inputs:
+        path: $(Build.SourcesDirectory)/deploy
+        artifactName: deploy
+  - job: BuildDotNet
+    dependsOn:
+    - GetPackage
+    - PublishDeployArtifact
+    pool:
+      vmImage: ubuntu-16.04
+    continueOnError: false
+    steps:
+    - task: Bash@3
+      displayName: Set Version Variables
+      inputs:
+        targetType: inline
+        script: >
+          commitSHA=$(Build.SourceVersion)
+
+          branch=$(Build.SourceBranchName)
+
+          buildMetadata=$(Build.BuildId).${commitSHA:0:7}
+
+          SemVer=$(Version.Semantic)
+
+          echo "##vso[task.setvariable variable=Version.BuildMetadata;]${buildMetadata}"
+
+          echo "##vso[task.setvariable variable=Version.ReleaseMetadata;]rc.${buildMetadata}"
+
+          echo "##vso[task.setvariable variable=Version.ReleaseCandidate;]${branch}-rc.${buildMetadata}"
+
+          echo "Build Number: ${SemVer}-${branch}"
+
+          echo "##vso[build.updatebuildnumber]${SemVer}-${branch}"
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: Download DevOps Artefacts
+      inputs:
+        alias: current
+        artifact: DevOps
+    - task: Bash@3
+      displayName: 'Install: DevOps Tools'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Bootstrap/install-cicd-prereqs.sh
+        arguments: $(System.DefaultWorkingDirectory)/kustomize https://github.com/kubernetes-sigs/kustomize/releases/download/v2.0.3/kustomize_2.0.3_linux_amd64
+    - task: Bash@3
+      displayName: 'Login: Azure'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/set-azure-context.sh
+        arguments: $(ARM_TENANT_ID) $(ARM_SUBSCRIPTION_ID) $(ARM_CLIENT_ID) $(ARM_CLIENT_SECRET)
+        failOnStderr: true
+    - task: NuGetCommand@2
+      displayName: Authenticate NuGet Packages Feed
+      inputs:
+        command: custom
+        arguments: sources update -Name "Azure DevOps" -Username "vsts" -Password "$(System.AccessToken)" -StorePasswordInClearText -ConfigFile ./service/NuGet.config
+        workingDirectory: ''
+    - task: UseDotNet@2
+      displayName: Install DOTNET 3.1
+      inputs:
+        packageType: sdk
+        version: 3.1.100
+        installationPath: $(Agent.ToolsDirectory)/dotnet
+    - task: DotNetCoreCLI@2
+      displayName: 'Test: Unit Tests'
+      inputs:
+        command: test
+        projects: $(Test.UnitTestProjects)
+        arguments: --configuration $(BuildConfiguration) /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura
+        testRunTitle: Unit Tests
+        failOnStderr: true
+    - task: DotNetCoreCLI@2
+      displayName: 'Test: Component Tests'
+      inputs:
+        command: test
+        projects: $(Test.ComponentTestProjects)
+        arguments: /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura
+        testRunTitle: Component Tests
+        failOnStderr: true
+    - task: Bash@3
+      displayName: Replace tokens
+      inputs:
+        filePath: $(Pipeline.Workspace)/DevOps/AzureDevOps/replace-tokens.sh
+        arguments: "'$(Test.IntegrationTestAppSetingsFile)'"
+      env:
+        DYNAMICSAZUREAD_TOKENENDPOINT: $(DYNAMICSAZUREAD_TOKENENDPOINT)
+        DYNAMICSAZUREAD_RESOURCE: $(DYNAMICSAZUREAD_RESOURCE)
+        DYNAMICS_URL: $(DYNAMICS_URL)
+        DYNAMICSAZUREAD_CLIENTID: $(DYNAMICSAZUREAD_CLIENTID)
+        DYNAMICSAZUREAD_CRMUSERNAME: $(DYNAMICSAZUREAD_CRMUSERNAME)
+        DYNAMICSAZUREAD_CRMPASSWORD: $(DYNAMICSAZUREAD_CRMPASSWORD)
+        DYNAMICSTESTDATA_PREMISESID: BBF0FACB-7A71-E811-80DE-0050569540E1
+        DYNAMICSAZUREAD_CACHETIMEINMINUTES: 15
+        PREMISESGATEWAYAPICONFIGURATION_RETRYCOUNT: 1
+        PREMISESGATEWAYAPICONFIGURATION_TIMEOUTSECONDS: 60
+        SEARCH_PRIMARY_KEY: $(SEARCH_PRIMARY_KEY)
+        SEARCH_SERVICE_NAME: $(SEARCH_NAME)
+        DROOLS_ENDPOINT: $(DROOLS_ENDPOINT)
+        DROOLS_PREMISES_RULE: $(DROOLS_PREMISES_RULE)
+        DROOLS_PREMISES_PACKAGENAME: $(DROOLS_PREMISES_PACKAGENAME)
+        DROOLS_BASIC_AUTH_TOKEN: $(DROOLS_BASIC_AUTH_TOKEN)
+    - task: DotNetCoreCLI@2
+      displayName: 'Test: Integration Tests'
+      inputs:
+        command: test
+        projects: $(Test.IntegrationTestProjects)
+        arguments: --configuration $(BuildConfiguration) /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura
+        testRunTitle: Integration Tests
+        failOnStderr: true
+    - task: Palmmedia.reportgenerator.reportgenerator-build-release-task.reportgenerator@4
+      displayName: ReportGenerator
+      inputs:
+        reports: $(Build.SourcesDirectory)/service/Peabody.*/coverage.cobertura.xml
+        targetdir: $(Build.SourcesDirectory)/CodeCoverage
+        reporttypes: HtmlInline_AzurePipelines;Cobertura;Badges
+        assemblyfilters: -xunit.*;-Pipelines.*;-StackExchange.*;-FluentValidation*
+    - task: PublishCodeCoverageResults@1
+      displayName: Publish code coverage
+      inputs:
+        codeCoverageTool: Cobertura
+        summaryFileLocation: $(Build.SourcesDirectory)/CodeCoverage/Cobertura.xml
+        reportDirectory: $(Build.SourcesDirectory)/CodeCoverage
+        failOnStderr: true
+    - task: UniversalPackages@0
+      displayName: ODC CLI and Data Package Download
+      inputs:
+        command: download
+        vstsFeed: $(AzureDevOps.Organisation)
+        vstsFeedPackage: owasp-dependency-check-cli
+        vstsPackageVersion: 6.*
+        downloadDirectory: $(Build.SourcesDirectory)/dependency-check
+    - task: Bash@3
+      displayName: ODC CLI Scanning
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Dependency-check/dependency-scan.sh
+        arguments: >
+          '$(Build.SourcesDirectory)/service' '**/*.csproj' '$(Agent.TempDirectory)/dependency-scan-results' 'ALL' 'BE' '' '7' '$(Build.SourcesDirectory)/service/owasp-dependency-check-suppressions.xml'
+        workingDirectory: $(Build.SourcesDirectory)
+      continueOnError: true
+    - task: PublishTestResults@2
+      condition: succeededOrFailed()
+      displayName: Publish ODC Results
+      inputs:
+        testResultsFormat: JUnit
+        testResultsFiles: $(Agent.TempDirectory)/dependency-scan-results/dependency-check-junit.xml
+        testRunTitle: Dependency Scan
+    - task: PublishPipelineArtifact@1
+      condition: succeededOrFailed()
+      displayName: Publish ODC Artifacts
+      inputs:
+        targetPath: $(Agent.TempDirectory)/dependency-scan-results
+        artifactName: dependency-check-$(System.JobAttempt)
+    - task: NuGetCommand@2
+      displayName: Authenticate NuGet Packages Feed
+      inputs:
+        command: custom
+        arguments: sources update -Name "Azure DevOps" -Username "vsts" -Password "$(System.AccessToken)" -StorePasswordInClearText -ConfigFile ./service/NuGet.config
+        workingDirectory: ''
+    - task: Bash@3
+      displayName: Build $(Docker.API.Imagename)
+      inputs:
+        targetType: inline
+        script: >
+          echo "Dockerfile - $(Docker.API.Dockerfile)"
+
+          echo "Image name - $(Docker.API.Imagename)"
+
+          echo "Image tag - $(Version.Semantic)"
+
+          echo "Assembly version - $(Version.Semantic)+$(Version.BuildMetadata)"
+
+          docker build . -f $(Docker.API.Dockerfile)  --build-arg VERSION=$(Version.Semantic)+$(Version.BuildMetadata) \
+            -t $(Docker.API.Imagename):$(Version.Semantic) \
+            -t $(DOCKER_CONTAINER_REGISTRY_URL)/$(Docker.API.Imagename):$(Version.Semantic)
+        workingDirectory: $(Docker.WorkDir)
+    - task: Bash@3
+      displayName: Vulnerability Scan
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Docker/new-image-scan.sh
+        arguments: $(Docker.API.Imagename) $(Version.Semantic) 0.11.0
+        workingDirectory: $(Build.ArtifactStagingDirectory)
+      continueOnError: true
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: $(Build.ArtifactStagingDirectory)/$(Docker.API.Imagename)-$(Version.Semantic)_MEDIUM-HIGH.txt
+        artifactName: $(Docker.API.Imagename)-$(Version.Semantic)_MEDIUM-HIGH.txt-$(System.JobAttempt)
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: $(Build.ArtifactStagingDirectory)/$(Docker.API.Imagename)-$(Version.Semantic)_CRITICAL.txt
+        artifactName: $(Docker.API.Imagename)-$(Version.Semantic)_CRITICAL.txt-$(System.JobAttempt)
+    - task: Bash@3
+      displayName: Push Container Image to Azure Container Registry
+      inputs:
+        targetType: inline
+        script: >
+          az acr login --name $(DOCKER_CONTAINER_REGISTRY_NAME)
+
+          docker push $(DOCKER_CONTAINER_REGISTRY_URL)/$(Docker.API.Imagename)
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish: Functional Tests Artifact'
+      inputs:
+        targetPath: $(Build.SourcesDirectory)/tests
+        artifactName: functional-tests
+- stage: DeployMaster
+  dependsOn:
+  - BuildTestMaster
+  variables:
+  - group: ergo-subscription-nonprod
+  - group: core-subscription-nonprod
+  - group: services-secrets-test
+  - group: core-test
+  - group: search-test
+  - group: drools-test
+  - name: Kubernetes.ClusterResourceGroup
+    value: pb-uks-np-ergo-rg-aks
+  - name: Kubernetes.ClusterName
+    value: pb-uks-np-ergo-aks
+  jobs:
+  - deployment: InitDeploy
+    environment:
+      name: premises_test
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: Bash@3
+            inputs:
+              targetType: inline
+              script: echo "Checking Azure DevOps environment for approvals..."
+  - job: HelmDeploy
+    dependsOn: []
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: Bash@3
+      displayName: Set Version Variables
+      inputs:
+        targetType: inline
+        script: >
+          commitSHA=$(Build.SourceVersion)
+
+          branch=$(Build.SourceBranchName)
+
+          buildMetadata=$(Build.BuildId).${commitSHA:0:7}
+
+          SemVer=$(Version.Semantic)
+
+          echo "##vso[task.setvariable variable=Version.BuildMetadata;]${buildMetadata}"
+
+          echo "##vso[task.setvariable variable=Version.ReleaseMetadata;]rc.${buildMetadata}"
+
+          echo "##vso[task.setvariable variable=Version.ReleaseCandidate;]${branch}-rc.${buildMetadata}"
+
+          echo "Build Number: ${SemVer}-${branch}"
+
+          echo "##vso[build.updatebuildnumber]${SemVer}-${branch}"
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: 'Download: Build Artefacts'
+      inputs:
+        alias: current
+        artifact: deploy
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: 'Download: Test Artefacts'
+      inputs:
+        alias: current
+        artifact: functional-tests
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: Download DevOps Artefacts
+      inputs:
+        alias: current
+        artifact: DevOps
+    - task: Bash@3
+      displayName: 'Install: DevOps Tools'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Bootstrap/install-cicd-prereqs.sh
+        arguments: $(System.DefaultWorkingDirectory)/kustomize https://github.com/kubernetes-sigs/kustomize/releases/download/v2.0.3/kustomize_2.0.3_linux_amd64
+    - task: Bash@3
+      displayName: 'Login: Azure'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/set-azure-context.sh
+        arguments: $(ARM_TENANT_ID) $(ARM_SUBSCRIPTION_ID) $(ARM_CLIENT_ID) $(ARM_CLIENT_SECRET)
+        failOnStderr: true
+    - task: Bash@3
+      displayName: 'Login: Kubernetes'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/set-aks-context.sh
+        arguments: $(Kubernetes.ClusterResourceGroup) $(Kubernetes.ClusterName)
+        failOnStderr: true
+    - task: UniversalPackages@0
+      name: download_az_package
+      displayName: Download AZ 4.7.0
+      inputs:
+        command: download
+        vstsFeed: $(AzureDevOps.Organisation)
+        vstsFeedPackage: pwsh.az.modules
+        vstsPackageVersion: 4.7.0
+        downloadDirectory: $(Agent.TempDirectory)/az
+    - task: PowerShell@2
+      displayName: 'Install: Az'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/install-az-module.ps1
+        arguments: >
+          -localRepository -localModuleDir '$(Agent.TempDirectory)/az'
+        failOnStderr: true
+    - task: PowerShell@2
+      displayName: 'Login: Powershell'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/set-pwsh-az-context.ps1
+        arguments: $(ARM_CLIENT_ID) $(ARM_CLIENT_SECRET) $(ARM_TENANT_ID) $(ARM_SUBSCRIPTION_ID)
+        failOnStderr: true
+    - task: Bash@3
+      displayName: Replace tokens
+      inputs:
+        filePath: $(Pipeline.Workspace)/DevOps/AzureDevOps/replace-tokens.sh
+        arguments: "'$(Pipeline.Workspace)/deploy/helm/premises-api/values.yaml $(Pipeline.Workspace)/deploy/helm/premises-api/Chart.yaml'"
+      env:
+        BUILD_VERSION: $(Version.Semantic)
+        APPLICATION_INSIGHTS_KEY: $(APPLICATION_INSIGHTS_INSTRUMENTATION_KEY)
+        TENANT_ID: $(ARM_TENANT_ID)
+        AZURE_AD_BACKEND_CLIENT_ID: $(azureclientid)
+        DYNAMICSAZUREAD_TOKENENDPOINT: $(DYNAMICSAZUREAD_TOKENENDPOINT)
+        DYNAMICSAZUREAD_RESOURCE: $(DYNAMICSAZUREAD_RESOURCE)
+        DYNAMICSAZUREAD_CLIENTID: $(DYNAMICSAZUREAD_CLIENTID)
+        DYNAMICSAZUREAD_CRMUSERNAME: $(DYNAMICSAZUREAD_CRMUSERNAME)
+        DYNAMICSAZUREAD_CRMPASSWORD: $(DYNAMICSAZUREAD_CRMPASSWORD)
+        DYNAMICS_URL: $(DYNAMICS_URL)
+        DYNAMICSAZUREAD_CACHETIMEINMINUTES: 15
+        PREMISESGATEWAYAPICONFIGURATION_RETRYCOUNT: 1
+        PREMISESGATEWAYAPICONFIGURATION_TIMEOUTSECONDS: 60
+        SEARCH_PRIMARY_KEY: $(SEARCH_PRIMARY_KEY)
+        SEARCH_SERVICE_NAME: $(SEARCH_NAME)
+        LOGLEVEL_DEFAULT: Information
+        LOGLEVEL_DEFAULT_MICROSOFT: Warning
+        API_POD_REPLICA_COUNT: 1
+        DROOLS_ENDPOINT: $(DROOLS_ENDPOINT)
+        DROOLS_PREMISES_RULE: $(DROOLS_PREMISES_RULE)
+        DROOLS_PREMISES_PACKAGENAME: $(DROOLS_PREMISES_PACKAGENAME)
+        DROOLS_BASIC_AUTH_TOKEN: $(DROOLS_BASIC_AUTH_TOKEN)
+    - task: Bash@3
+      displayName: Helm Lint premises-api-$(ENVIRONMENT)
+      inputs:
+        targetType: inline
+        script: >
+          helm lint ./helm/premises-api
+        workingDirectory: $(Pipeline.Workspace)/deploy
+    - task: Bash@3
+      displayName: upgrade/install premises-api-$(ENVIRONMENT)
+      inputs:
+        filePath: $(Pipeline.Workspace)/DevOps/Helm/helm-upgrade-install.sh
+        workingDirectory: $(Pipeline.Workspace)/deploy
+        arguments: >
+          $(Kubernetes.ClusterName) $(ENVIRONMENT)-premises premises-api-$(ENVIRONMENT) helm/premises-api helm/premises-api/values.yaml $(Version.Semantic)
+    - task: Bash@3
+      displayName: 'Kubectl: get deployment properties'
+      inputs:
+        targetType: inline
+        script: >
+          # Check deployment rollout status every 10 seconds (max 5 minutes) until complete.
+
+          ATTEMPTS=0
+
+          ROLLOUT_STATUS_CMD="kubectl rollout status --namespace=$(ENVIRONMENT)-premises deployments/premises-api-$(ENVIRONMENT)"
+
+          until $ROLLOUT_STATUS_CMD || [ $ATTEMPTS -eq 30 ]; do
+            $ROLLOUT_STATUS_CMD
+            ATTEMPTS=$((attempts + 1))
+            sleep 10
+          done
+
+
+          container=$(kubectl get pods --namespace=$(ENVIRONMENT)-premises --selector=release=premises-api-$(ENVIRONMENT),version=$(Version.Semantic) -o jsonpath='{.items[0].metadata.name}')
+
+          echo "container: $container"
+
+          service=$(kubectl get service --namespace=$(ENVIRONMENT)-premises --selector=release=premises-api-$(ENVIRONMENT) -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}')
+
+          echo "Service IP: $service"
+
+          swagger=$(kubectl exec --namespace=$(ENVIRONMENT)-premises ${container} -- curl -s localhost/swagger/all/swagger.json)
+
+          echo $swagger > premises-api-$(ENVIRONMENT)-swagger.json
+
+          echo "--------- swagger -----------"
+
+          cat premises-api-$(ENVIRONMENT)-swagger.json
+
+          echo "--------- swagger -----------"
+
+          echo "##vso[task.setvariable variable=SERVICE_URL]http://${service}"
+        failOnStderr: true
+        workingDirectory: $(Pipeline.Workspace)
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: $(Pipeline.Workspace)/premises-api-$(ENVIRONMENT)-swagger.json
+        artifactName: premises-api-$(ENVIRONMENT)-swagger-$(System.JobAttempt)
+    - task: PowerShell@2
+      displayName: Update APIM API definition - premises-api-$(ENVIRONMENT)
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/import-apim-api.ps1
+        arguments: >
+          -resourceGroupName $(CORE_RESOURCE_GROUP) -serviceName $(APIM_SERVICE_NAME) -apiId premises-api-$(ENVIRONMENT) -apiPath /premises -specificationPath premises-api-$(ENVIRONMENT)-swagger.json
+        workingDirectory: $(Pipeline.Workspace)
+        failOnStderr: true
+    - task: UseDotNet@2
+      displayName: Use .NET Core SDK 3.1.100
+      inputs:
+        packageType: sdk
+        version: 3.1.100
+        installationPath: $(Agent.ToolsDirectory)/dotnet
+    - task: NuGetCommand@2
+      displayName: Authenticate NuGet Packages Feed
+      inputs:
+        command: custom
+        arguments: sources update -Name "Azure DevOps" -Username "vsts" -Password "$(System.AccessToken)" -StorePasswordInClearText -ConfigFile $(Pipeline.Workspace)/functional-tests/$(Test.FunctionalTestNugetPath)
+        workingDirectory: ''
+    - task: Bash@3
+      displayName: Replace tokens
+      inputs:
+        filePath: $(Pipeline.Workspace)/DevOps/AzureDevOps/replace-tokens.sh
+        arguments: "'$(Pipeline.Workspace)/functional-tests/$(Test.FunctionalTestAppSetingsFile)'"
+      env:
+        BASE_URL: $(APIM_GATEWAY_URL)/premises/
+        OCP_APIM_SUBSCRIPTION_KEY: $(APIM_FULL_ACCESS_PRIMARY_KEY)
+        TENANT_ID: $(ARM_TENANT_ID)
+        AZURE_AD_BACKEND_CLIENT_ID: $(azureclientid)
+        AZURE_AD_CONSUMER_CLIENT_ID: $(WEB_APP_AAD_CLIENT_ID)
+        AZURE_AD_CONSUMER_CLIENT_SECRET: $(WEB_APP_AAD_CLIENT_SECRET)
+        SEARCH_PRIMARY_KEY: $(SEARCH_PRIMARY_KEY)
+        SEARCH_SERVICE_NAME: $(SEARCH_NAME)
+    - task: DotNetCoreCLI@2
+      displayName: 'Test: Run Functional Tests'
+      inputs:
+        command: test
+        projects: $(Pipeline.Workspace)/functional-tests/$(Test.FunctionalTestProject)
+        arguments: '-v n '
+        testRunTitle: Functional Tests
+    - task: Bash@3
+      displayName: 'Upload: Test Results'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/upload-azstorage-blob.sh
+        arguments: $(Test.FunctionalTestReportStorageAccountRG) $(Test.FunctionalTestReportSourcePath) $(Test.FunctionalTestReportStorageAccountName) $(Test.FunctionalTestReportStorageContainerName) $(Test.FunctionalTestReportTargetName)
+    - task: Bash@3
+      displayName: 'Retrieve URL: Test Results'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/get-azstorage-sasurl.sh
+        arguments: $(Test.FunctionalTestReportStorageAccountRG) $(Test.FunctionalTestReportStorageAccountName) $(Test.FunctionalTestReportStorageContainerName) $(Test.FunctionalTestReportTargetName)
+- stage: BuildTestUAT
+  condition: startsWith(variables['Build.SourceBranch'], 'refs/heads/release/api')
+  dependsOn: []
+  variables:
+  - group: ergo-subscription-nonprod
+  - group: core-subscription-nonprod
+  - group: services-secrets-uat
+  - group: search-uat
+  - group: drools-uat
+  jobs:
+  - job: GetPackage
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: Bash@3
+      displayName: 'Get Package: DevOps'
+      env:
+        azure_client_id: $(ARM_CLIENT_ID)
+        azure_client_secret: $(ARM_CLIENT_SECRET)
+        azure_subscription_id: $(ARM_SUBSCRIPTION_ID)
+        azure_tenant_id: $(ARM_TENANT_ID)
+      inputs:
+        targetType: inline
+        script: >
+          az login --service-principal --username $azure_client_id --password $azure_client_secret --tenant $azure_tenant_id
+
+          #az account set -s $azure_subscription_id
+
+          ACCOUNT_KEY=$( az storage account keys list -g $(DevOps.RG) -n $(DevOps.storageAccount) --query '[1].value' )
+
+          SAS_KEY_EXPIRY=$( date -d "1 month" '+%Y-%m-%dT%H:%MZ' )
+
+          SAS_KEY=$( az storage account generate-sas --permissions lr --account-name $(DevOps.storageAccount) --account-key $ACCOUNT_KEY --services b --resource-types sco --expiry $SAS_KEY_EXPIRY -otsv )
+
+          SAS_KEY=$( sed -e 's/^"//' -e 's/"$//' <<<"$SAS_KEY" )
+
+          BLOB_URL=$( az storage blob url --account-name $(DevOps.storageAccount) --account-key $ACCOUNT_KEY --container-name $(DevOps.Container) --name $(DevOps.File) )
+
+          BLOB_URL=$( sed -e 's/^"//' -e 's/"$//' <<<"$BLOB_URL" )
+
+          wget -O $(Build.BinariesDirectory)/$(DevOps.File) $BLOB_URL?$SAS_KEY
+
+          az logout --username $azure_client_id
+        workingDirectory: $(Build.BinariesDirectory)
+    - task: ExtractFiles@1
+      inputs:
+        archiveFilePatterns: $(Build.BinariesDirectory)/$(DevOps.File)
+        destinationFolder: $(Build.BinariesDirectory)/DevOps
+      displayName: 'Extract Package: DevOps'
+    - task: ecdc45f6-832d-4ad9-b52b-ee49e94659be@1
+      inputs:
+        path: $(Build.BinariesDirectory)/DevOps
+        artifactName: DevOps
+  - job: PublishDeployArtifact
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: ecdc45f6-832d-4ad9-b52b-ee49e94659be@1
+      inputs:
+        path: $(Build.SourcesDirectory)/deploy
+        artifactName: deploy
+  - job: BuildDotNet
+    dependsOn:
+    - GetPackage
+    - PublishDeployArtifact
+    pool:
+      vmImage: ubuntu-16.04
+    continueOnError: false
+    steps:
+    - task: Bash@3
+      displayName: Set Version Variables
+      inputs:
+        targetType: inline
+        script: >
+          commitSHA=$(Build.SourceVersion)
+
+          branch=$(Build.SourceBranchName)
+
+          buildMetadata=$(Build.BuildId).${commitSHA:0:7}
+
+          SemVer=$(Version.Semantic)
+
+          echo "##vso[task.setvariable variable=Version.BuildMetadata;]${buildMetadata}"
+
+          echo "##vso[task.setvariable variable=Version.ReleaseMetadata;]rc.${buildMetadata}"
+
+          echo "##vso[task.setvariable variable=Version.ReleaseCandidate;]${branch}-rc.${buildMetadata}"
+
+          echo "Build Number: ${SemVer}-${branch}"
+
+          echo "##vso[build.updatebuildnumber]${SemVer}-${branch}"
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: Download DevOps Artefacts
+      inputs:
+        alias: current
+        artifact: DevOps
+    - task: Bash@3
+      displayName: 'Install: DevOps Tools'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Bootstrap/install-cicd-prereqs.sh
+        arguments: $(System.DefaultWorkingDirectory)/kustomize https://github.com/kubernetes-sigs/kustomize/releases/download/v2.0.3/kustomize_2.0.3_linux_amd64
+    - task: Bash@3
+      displayName: 'Login: Azure'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/set-azure-context.sh
+        arguments: $(ARM_TENANT_ID) $(ARM_SUBSCRIPTION_ID) $(ARM_CLIENT_ID) $(ARM_CLIENT_SECRET)
+        failOnStderr: true
+    - task: NuGetCommand@2
+      displayName: Authenticate NuGet Packages Feed
+      inputs:
+        command: custom
+        arguments: sources update -Name "Azure DevOps" -Username "vsts" -Password "$(System.AccessToken)" -StorePasswordInClearText -ConfigFile ./service/NuGet.config
+        workingDirectory: ''
+    - task: UseDotNet@2
+      displayName: Install DOTNET 3.1
+      inputs:
+        packageType: sdk
+        version: 3.1.100
+        installationPath: $(Agent.ToolsDirectory)/dotnet
+    - task: DotNetCoreCLI@2
+      displayName: 'Test: Unit Tests'
+      inputs:
+        command: test
+        projects: $(Test.UnitTestProjects)
+        arguments: --configuration $(BuildConfiguration) /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura
+        testRunTitle: Unit Tests
+        failOnStderr: true
+    - task: DotNetCoreCLI@2
+      displayName: 'Test: Component Tests'
+      inputs:
+        command: test
+        projects: $(Test.ComponentTestProjects)
+        arguments: /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura
+        testRunTitle: Component Tests
+        failOnStderr: true
+    - task: Bash@3
+      displayName: Replace tokens
+      inputs:
+        filePath: $(Pipeline.Workspace)/DevOps/AzureDevOps/replace-tokens.sh
+        arguments: "'$(Test.IntegrationTestAppSetingsFile)'"
+      env:
+        DYNAMICSAZUREAD_TOKENENDPOINT: $(DYNAMICSAZUREAD_TOKENENDPOINT)
+        DYNAMICSAZUREAD_RESOURCE: $(DYNAMICSAZUREAD_RESOURCE)
+        DYNAMICS_URL: $(DYNAMICS_URL)
+        DYNAMICSAZUREAD_CLIENTID: $(DYNAMICSAZUREAD_CLIENTID)
+        DYNAMICSAZUREAD_CRMUSERNAME: $(DYNAMICSAZUREAD_CRMUSERNAME)
+        DYNAMICSAZUREAD_CRMPASSWORD: $(DYNAMICSAZUREAD_CRMPASSWORD)
+        DYNAMICSTESTDATA_PREMISESID: BBF0FACB-7A71-E811-80DE-0050569540E1
+        DYNAMICSAZUREAD_CACHETIMEINMINUTES: 15
+        PREMISESGATEWAYAPICONFIGURATION_RETRYCOUNT: 1
+        PREMISESGATEWAYAPICONFIGURATION_TIMEOUTSECONDS: 60
+        SEARCH_PRIMARY_KEY: $(SEARCH_PRIMARY_KEY)
+        SEARCH_SERVICE_NAME: $(SEARCH_NAME)
+        DROOLS_ENDPOINT: $(DROOLS_ENDPOINT)
+        DROOLS_PREMISES_RULE: $(DROOLS_PREMISES_RULE)
+        DROOLS_PREMISES_PACKAGENAME: $(DROOLS_PREMISES_PACKAGENAME)
+        DROOLS_BASIC_AUTH_TOKEN: $(DROOLS_BASIC_AUTH_TOKEN)
+    - task: DotNetCoreCLI@2
+      displayName: 'Test: Integration Tests'
+      inputs:
+        command: test
+        projects: $(Test.IntegrationTestProjects)
+        arguments: --configuration $(BuildConfiguration) /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura
+        testRunTitle: Integration Tests
+        failOnStderr: true
+    - task: Palmmedia.reportgenerator.reportgenerator-build-release-task.reportgenerator@4
+      displayName: ReportGenerator
+      inputs:
+        reports: $(Build.SourcesDirectory)/service/Peabody.*/coverage.cobertura.xml
+        targetdir: $(Build.SourcesDirectory)/CodeCoverage
+        reporttypes: HtmlInline_AzurePipelines;Cobertura;Badges
+        assemblyfilters: -xunit.*;-Pipelines.*;-StackExchange.*;-FluentValidation*
+    - task: PublishCodeCoverageResults@1
+      displayName: Publish code coverage
+      inputs:
+        codeCoverageTool: Cobertura
+        summaryFileLocation: $(Build.SourcesDirectory)/CodeCoverage/Cobertura.xml
+        reportDirectory: $(Build.SourcesDirectory)/CodeCoverage
+        failOnStderr: true
+    - task: UniversalPackages@0
+      displayName: ODC CLI and Data Package Download
+      inputs:
+        command: download
+        vstsFeed: $(AzureDevOps.Organisation)
+        vstsFeedPackage: owasp-dependency-check-cli
+        vstsPackageVersion: 6.*
+        downloadDirectory: $(Build.SourcesDirectory)/dependency-check
+    - task: Bash@3
+      displayName: ODC CLI Scanning
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Dependency-check/dependency-scan.sh
+        arguments: >
+          '$(Build.SourcesDirectory)/service' '**/*.csproj' '$(Agent.TempDirectory)/dependency-scan-results' 'ALL' 'BE' '' '7' '$(Build.SourcesDirectory)/service/owasp-dependency-check-suppressions.xml'
+        workingDirectory: $(Build.SourcesDirectory)
+      continueOnError: true
+    - task: PublishTestResults@2
+      condition: succeededOrFailed()
+      displayName: Publish ODC Results
+      inputs:
+        testResultsFormat: JUnit
+        testResultsFiles: $(Agent.TempDirectory)/dependency-scan-results/dependency-check-junit.xml
+        testRunTitle: Dependency Scan
+    - task: PublishPipelineArtifact@1
+      condition: succeededOrFailed()
+      displayName: Publish ODC Artifacts
+      inputs:
+        targetPath: $(Agent.TempDirectory)/dependency-scan-results
+        artifactName: dependency-check-$(System.JobAttempt)
+    - task: NuGetCommand@2
+      displayName: Authenticate NuGet Packages Feed
+      inputs:
+        command: custom
+        arguments: sources update -Name "Azure DevOps" -Username "vsts" -Password "$(System.AccessToken)" -StorePasswordInClearText -ConfigFile ./service/NuGet.config
+        workingDirectory: ''
+    - task: Bash@3
+      displayName: Build $(Docker.API.Imagename)
+      inputs:
+        targetType: inline
+        script: >
+          echo "Dockerfile - $(Docker.API.Dockerfile)"
+
+          echo "Image name - $(Docker.API.Imagename)"
+
+          echo "Image tag - $(Version.Semantic)"
+
+          echo "Assembly version - $(Version.Semantic)+$(Version.BuildMetadata)"
+
+          docker build . -f $(Docker.API.Dockerfile)  --build-arg VERSION=$(Version.Semantic)+$(Version.BuildMetadata) \
+            -t $(Docker.API.Imagename):$(Version.Semantic) \
+            -t $(DOCKER_CONTAINER_REGISTRY_URL)/$(Docker.API.Imagename):$(Version.Semantic)
+        workingDirectory: $(Docker.WorkDir)
+    - task: Bash@3
+      displayName: Vulnerability Scan
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Docker/new-image-scan.sh
+        arguments: $(Docker.API.Imagename) $(Version.Semantic) 0.11.0
+        workingDirectory: $(Build.ArtifactStagingDirectory)
+      continueOnError: true
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: $(Build.ArtifactStagingDirectory)/$(Docker.API.Imagename)-$(Version.Semantic)_MEDIUM-HIGH.txt
+        artifactName: $(Docker.API.Imagename)-$(Version.Semantic)_MEDIUM-HIGH.txt-$(System.JobAttempt)
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: $(Build.ArtifactStagingDirectory)/$(Docker.API.Imagename)-$(Version.Semantic)_CRITICAL.txt
+        artifactName: $(Docker.API.Imagename)-$(Version.Semantic)_CRITICAL.txt-$(System.JobAttempt)
+    - task: Bash@3
+      displayName: Push Container Image to Azure Container Registry
+      inputs:
+        targetType: inline
+        script: >
+          az acr login --name $(DOCKER_CONTAINER_REGISTRY_NAME)
+
+          docker push $(DOCKER_CONTAINER_REGISTRY_URL)/$(Docker.API.Imagename)
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish: Functional Tests Artifact'
+      inputs:
+        targetPath: $(Build.SourcesDirectory)/tests
+        artifactName: functional-tests
+- stage: DeployUAT
+  dependsOn:
+  - BuildTestUAT
+  variables:
+  - group: ergo-subscription-nonprod
+  - group: core-subscription-nonprod
+  - group: services-secrets-uat
+  - group: core-uat
+  - group: search-uat
+  - group: drools-uat
+  - name: Kubernetes.ClusterResourceGroup
+    value: pb-uks-np-ergo-rg-aks
+  - name: Kubernetes.ClusterName
+    value: pb-uks-np-ergo-aks
+  jobs:
+  - deployment: InitDeploy
+    environment:
+      name: premises_uat
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: Bash@3
+            inputs:
+              targetType: inline
+              script: echo "Checking Azure DevOps environment for approvals..."
+  - job: HelmDeploy
+    dependsOn: []
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: Bash@3
+      displayName: Set Version Variables
+      inputs:
+        targetType: inline
+        script: >
+          commitSHA=$(Build.SourceVersion)
+
+          branch=$(Build.SourceBranchName)
+
+          buildMetadata=$(Build.BuildId).${commitSHA:0:7}
+
+          SemVer=$(Version.Semantic)
+
+          echo "##vso[task.setvariable variable=Version.BuildMetadata;]${buildMetadata}"
+
+          echo "##vso[task.setvariable variable=Version.ReleaseMetadata;]rc.${buildMetadata}"
+
+          echo "##vso[task.setvariable variable=Version.ReleaseCandidate;]${branch}-rc.${buildMetadata}"
+
+          echo "Build Number: ${SemVer}-${branch}"
+
+          echo "##vso[build.updatebuildnumber]${SemVer}-${branch}"
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: 'Download: Build Artefacts'
+      inputs:
+        alias: current
+        artifact: deploy
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: 'Download: Test Artefacts'
+      inputs:
+        alias: current
+        artifact: functional-tests
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: Download DevOps Artefacts
+      inputs:
+        alias: current
+        artifact: DevOps
+    - task: Bash@3
+      displayName: 'Install: DevOps Tools'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Bootstrap/install-cicd-prereqs.sh
+        arguments: $(System.DefaultWorkingDirectory)/kustomize https://github.com/kubernetes-sigs/kustomize/releases/download/v2.0.3/kustomize_2.0.3_linux_amd64
+    - task: Bash@3
+      displayName: 'Login: Azure'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/set-azure-context.sh
+        arguments: $(ARM_TENANT_ID) $(ARM_SUBSCRIPTION_ID) $(ARM_CLIENT_ID) $(ARM_CLIENT_SECRET)
+        failOnStderr: true
+    - task: Bash@3
+      displayName: 'Login: Kubernetes'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/set-aks-context.sh
+        arguments: $(Kubernetes.ClusterResourceGroup) $(Kubernetes.ClusterName)
+        failOnStderr: true
+    - task: UniversalPackages@0
+      name: download_az_package
+      displayName: Download AZ 4.7.0
+      inputs:
+        command: download
+        vstsFeed: $(AzureDevOps.Organisation)
+        vstsFeedPackage: pwsh.az.modules
+        vstsPackageVersion: 4.7.0
+        downloadDirectory: $(Agent.TempDirectory)/az
+    - task: PowerShell@2
+      displayName: 'Install: Az'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/install-az-module.ps1
+        arguments: >
+          -localRepository -localModuleDir '$(Agent.TempDirectory)/az'
+        failOnStderr: true
+    - task: PowerShell@2
+      displayName: 'Login: Powershell'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/set-pwsh-az-context.ps1
+        arguments: $(ARM_CLIENT_ID) $(ARM_CLIENT_SECRET) $(ARM_TENANT_ID) $(ARM_SUBSCRIPTION_ID)
+        failOnStderr: true
+    - task: Bash@3
+      displayName: Replace tokens
+      inputs:
+        filePath: $(Pipeline.Workspace)/DevOps/AzureDevOps/replace-tokens.sh
+        arguments: "'$(Pipeline.Workspace)/deploy/helm/premises-api/values.yaml $(Pipeline.Workspace)/deploy/helm/premises-api/Chart.yaml'"
+      env:
+        BUILD_VERSION: $(Version.Semantic)
+        APPLICATION_INSIGHTS_KEY: $(APPLICATION_INSIGHTS_INSTRUMENTATION_KEY)
+        TENANT_ID: $(ARM_TENANT_ID)
+        AZURE_AD_BACKEND_CLIENT_ID: $(azureclientid)
+        DYNAMICSAZUREAD_TOKENENDPOINT: $(DYNAMICSAZUREAD_TOKENENDPOINT)
+        DYNAMICSAZUREAD_RESOURCE: $(DYNAMICSAZUREAD_RESOURCE)
+        DYNAMICSAZUREAD_CLIENTID: $(DYNAMICSAZUREAD_CLIENTID)
+        DYNAMICSAZUREAD_CRMUSERNAME: $(DYNAMICSAZUREAD_CRMUSERNAME)
+        DYNAMICSAZUREAD_CRMPASSWORD: $(DYNAMICSAZUREAD_CRMPASSWORD)
+        DYNAMICS_URL: $(DYNAMICS_URL)
+        DYNAMICSAZUREAD_CACHETIMEINMINUTES: 15
+        PREMISESGATEWAYAPICONFIGURATION_RETRYCOUNT: 1
+        PREMISESGATEWAYAPICONFIGURATION_TIMEOUTSECONDS: 60
+        SEARCH_PRIMARY_KEY: $(SEARCH_PRIMARY_KEY)
+        SEARCH_SERVICE_NAME: $(SEARCH_NAME)
+        LOGLEVEL_DEFAULT: Information
+        LOGLEVEL_DEFAULT_MICROSOFT: Warning
+        API_POD_REPLICA_COUNT: 1
+        DROOLS_ENDPOINT: $(DROOLS_ENDPOINT)
+        DROOLS_PREMISES_RULE: $(DROOLS_PREMISES_RULE)
+        DROOLS_PREMISES_PACKAGENAME: $(DROOLS_PREMISES_PACKAGENAME)
+        DROOLS_BASIC_AUTH_TOKEN: $(DROOLS_BASIC_AUTH_TOKEN)
+    - task: Bash@3
+      displayName: Helm Lint premises-api-$(ENVIRONMENT)
+      inputs:
+        targetType: inline
+        script: >
+          helm lint ./helm/premises-api
+        workingDirectory: $(Pipeline.Workspace)/deploy
+    - task: Bash@3
+      displayName: upgrade/install premises-api-$(ENVIRONMENT)
+      inputs:
+        filePath: $(Pipeline.Workspace)/DevOps/Helm/helm-upgrade-install.sh
+        workingDirectory: $(Pipeline.Workspace)/deploy
+        arguments: >
+          $(Kubernetes.ClusterName) $(ENVIRONMENT)-premises premises-api-$(ENVIRONMENT) helm/premises-api helm/premises-api/values.yaml $(Version.Semantic)
+    - task: Bash@3
+      displayName: 'Kubectl: get deployment properties'
+      inputs:
+        targetType: inline
+        script: >
+          # Check deployment rollout status every 10 seconds (max 5 minutes) until complete.
+
+          ATTEMPTS=0
+
+          ROLLOUT_STATUS_CMD="kubectl rollout status --namespace=$(ENVIRONMENT)-premises deployments/premises-api-$(ENVIRONMENT)"
+
+          until $ROLLOUT_STATUS_CMD || [ $ATTEMPTS -eq 30 ]; do
+            $ROLLOUT_STATUS_CMD
+            ATTEMPTS=$((attempts + 1))
+            sleep 10
+          done
+
+
+          container=$(kubectl get pods --namespace=$(ENVIRONMENT)-premises --selector=release=premises-api-$(ENVIRONMENT),version=$(Version.Semantic) -o jsonpath='{.items[0].metadata.name}')
+
+          echo "container: $container"
+
+          service=$(kubectl get service --namespace=$(ENVIRONMENT)-premises --selector=release=premises-api-$(ENVIRONMENT) -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}')
+
+          echo "Service IP: $service"
+
+          swagger=$(kubectl exec --namespace=$(ENVIRONMENT)-premises ${container} -- curl -s localhost/swagger/all/swagger.json)
+
+          echo $swagger > premises-api-$(ENVIRONMENT)-swagger.json
+
+          echo "--------- swagger -----------"
+
+          cat premises-api-$(ENVIRONMENT)-swagger.json
+
+          echo "--------- swagger -----------"
+
+          echo "##vso[task.setvariable variable=SERVICE_URL]http://${service}"
+        failOnStderr: true
+        workingDirectory: $(Pipeline.Workspace)
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: $(Pipeline.Workspace)/premises-api-$(ENVIRONMENT)-swagger.json
+        artifactName: premises-api-$(ENVIRONMENT)-swagger-$(System.JobAttempt)
+    - task: PowerShell@2
+      displayName: Update APIM API definition - premises-api-$(ENVIRONMENT)
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/import-apim-api.ps1
+        arguments: >
+          -resourceGroupName $(CORE_RESOURCE_GROUP) -serviceName $(APIM_SERVICE_NAME) -apiId premises-api-$(ENVIRONMENT) -apiPath /premises -specificationPath premises-api-$(ENVIRONMENT)-swagger.json
+        workingDirectory: $(Pipeline.Workspace)
+        failOnStderr: true
+    - task: UseDotNet@2
+      displayName: Use .NET Core SDK 3.1.100
+      inputs:
+        packageType: sdk
+        version: 3.1.100
+        installationPath: $(Agent.ToolsDirectory)/dotnet
+    - task: NuGetCommand@2
+      displayName: Authenticate NuGet Packages Feed
+      inputs:
+        command: custom
+        arguments: sources update -Name "Azure DevOps" -Username "vsts" -Password "$(System.AccessToken)" -StorePasswordInClearText -ConfigFile $(Pipeline.Workspace)/functional-tests/$(Test.FunctionalTestNugetPath)
+        workingDirectory: ''
+    - task: Bash@3
+      displayName: Replace tokens
+      inputs:
+        filePath: $(Pipeline.Workspace)/DevOps/AzureDevOps/replace-tokens.sh
+        arguments: "'$(Pipeline.Workspace)/functional-tests/$(Test.FunctionalTestAppSetingsFile)'"
+      env:
+        BASE_URL: $(APIM_GATEWAY_URL)/premises/
+        OCP_APIM_SUBSCRIPTION_KEY: $(APIM_FULL_ACCESS_PRIMARY_KEY)
+        TENANT_ID: $(ARM_TENANT_ID)
+        AZURE_AD_BACKEND_CLIENT_ID: $(azureclientid)
+        AZURE_AD_CONSUMER_CLIENT_ID: $(WEB_APP_AAD_CLIENT_ID)
+        AZURE_AD_CONSUMER_CLIENT_SECRET: $(WEB_APP_AAD_CLIENT_SECRET)
+        SEARCH_PRIMARY_KEY: $(SEARCH_PRIMARY_KEY)
+        SEARCH_SERVICE_NAME: $(SEARCH_NAME)
+    - task: DotNetCoreCLI@2
+      displayName: 'Test: Run Functional Tests'
+      inputs:
+        command: test
+        projects: $(Pipeline.Workspace)/functional-tests/$(Test.FunctionalTestProject)
+        arguments: '-v n '
+        testRunTitle: Functional Tests
+    - task: Bash@3
+      displayName: 'Upload: Test Results'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/upload-azstorage-blob.sh
+        arguments: $(Test.FunctionalTestReportStorageAccountRG) $(Test.FunctionalTestReportSourcePath) $(Test.FunctionalTestReportStorageAccountName) $(Test.FunctionalTestReportStorageContainerName) $(Test.FunctionalTestReportTargetName)
+    - task: Bash@3
+      displayName: 'Retrieve URL: Test Results'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/get-azstorage-sasurl.sh
+        arguments: $(Test.FunctionalTestReportStorageAccountRG) $(Test.FunctionalTestReportStorageAccountName) $(Test.FunctionalTestReportStorageContainerName) $(Test.FunctionalTestReportTargetName)
+- stage: PromoteImagePreprod
+  dependsOn:
+  - DeployUAT
+  variables:
+  - group: ergo-subscription-preprod
+  - name: SOURCE_ACR_REGISTRY
+    value: pbuksnonprodergocrcsub
+  - name: TARGET_ACR_REGISTRY
+    value: pbukspreprodergocrcsub
+  jobs:
+  - job: SetSourceVariables
+    dependsOn: []
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+    - group: ergo-subscription-nonprod
+    steps:
+    - task: CmdLine@2
+      name: SetupSourceVariables
+      inputs:
+        script: >
+          echo "##vso[task.setvariable variable=SOURCE_TENANT_ID;isOutput=true]$(ARM_TENANT_ID)"
+
+          echo "##vso[task.setvariable variable=SOURCE_SUBSCRIPTION_ID;isOutput=true]$(ARM_SUBSCRIPTION_ID)"
+
+          echo "##vso[task.setvariable variable=SOURCE_CLIENT_ID;isOutput=true]$(ARM_CLIENT_ID)"
+
+          echo "##vso[task.setvariable variable=SOURCE_CLIENT_SECRET;isOutput=true]$(ARM_CLIENT_SECRET)"
+  - job: SetTargetVariables
+    dependsOn: []
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+    - group: ergo-subscription-preprod
+    steps:
+    - task: CmdLine@2
+      name: SetupTargetVariables
+      inputs:
+        script: >
+          echo "##vso[task.setvariable variable=TARGET_TENANT_ID;isOutput=true]$(ARM_TENANT_ID)"
+
+          echo "##vso[task.setvariable variable=TARGET_SUBSCRIPTION_ID;isOutput=true]$(ARM_SUBSCRIPTION_ID)"
+
+          echo "##vso[task.setvariable variable=TARGET_CLIENT_ID;isOutput=true]$(ARM_CLIENT_ID)"
+
+          echo "##vso[task.setvariable variable=TARGET_CLIENT_SECRET;isOutput=true]$(ARM_CLIENT_SECRET)"
+  - job: PromoteImages
+    dependsOn:
+    - SetSourceVariables
+    - SetTargetVariables
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+    - name: SOURCE_TENANT_ID
+      value: $[ dependencies.SetSourceVariables.outputs['SetupSourceVariables.SOURCE_TENANT_ID'] ]
+    - name: SOURCE_SUBSCRIPTION_ID
+      value: $[ dependencies.SetSourceVariables.outputs['SetupSourceVariables.SOURCE_SUBSCRIPTION_ID'] ]
+    - name: SOURCE_CLIENT_ID
+      value: $[ dependencies.SetSourceVariables.outputs['SetupSourceVariables.SOURCE_CLIENT_ID'] ]
+    - name: SOURCE_CLIENT_SECRET
+      value: $[ dependencies.SetSourceVariables.outputs['SetupSourceVariables.SOURCE_CLIENT_SECRET'] ]
+    - name: TARGET_TENANT_ID
+      value: $[ dependencies.SetTargetVariables.outputs['SetupTargetVariables.TARGET_TENANT_ID'] ]
+    - name: TARGET_SUBSCRIPTION_ID
+      value: $[ dependencies.SetTargetVariables.outputs['SetupTargetVariables.TARGET_SUBSCRIPTION_ID'] ]
+    - name: TARGET_CLIENT_ID
+      value: $[ dependencies.SetTargetVariables.outputs['SetupTargetVariables.TARGET_CLIENT_ID'] ]
+    - name: TARGET_CLIENT_SECRET
+      value: $[ dependencies.SetTargetVariables.outputs['SetupTargetVariables.TARGET_CLIENT_SECRET'] ]
+    continueOnError: False
+    steps:
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: 'Download: DevOps Artefacts'
+      inputs:
+        alias: current
+        artifact: DevOps
+    - task: Bash@3
+      displayName: 'Promote: Docker Image $(Docker.API.Imagename)'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/promote-acr-image.sh
+        arguments: >
+          $(SOURCE_TENANT_ID) $(SOURCE_SUBSCRIPTION_ID) $(SOURCE_CLIENT_ID) $(SOURCE_CLIENT_SECRET) $(SOURCE_ACR_REGISTRY) $(TARGET_TENANT_ID) $(TARGET_SUBSCRIPTION_ID) $(TARGET_CLIENT_ID) $(TARGET_CLIENT_SECRET) $(TARGET_ACR_REGISTRY) $(Docker.API.Imagename) $(Version.Semantic)
+- stage: DeployPreprod
+  dependsOn:
+  - PromoteImagePreprod
+  variables:
+  - group: ergo-subscription-preprod
+  - group: core-subscription-preprod
+  - group: services-secrets-preprod
+  - group: core-preprod
+  - group: search-preprod
+  - group: drools-preprod
+  - name: Kubernetes.ClusterResourceGroup
+    value: pb-uks-pp-ergo-rg-aks
+  - name: Kubernetes.ClusterName
+    value: pb-uks-pp-ergo-aks
+  jobs:
+  - deployment: InitDeploy
+    environment:
+      name: premises_preprod
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: Bash@3
+            inputs:
+              targetType: inline
+              script: echo "Checking Azure DevOps environment for approvals..."
+  - job: HelmDeploy
+    dependsOn: []
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: Bash@3
+      displayName: Set Version Variables
+      inputs:
+        targetType: inline
+        script: >
+          commitSHA=$(Build.SourceVersion)
+
+          branch=$(Build.SourceBranchName)
+
+          buildMetadata=$(Build.BuildId).${commitSHA:0:7}
+
+          SemVer=$(Version.Semantic)
+
+          echo "##vso[task.setvariable variable=Version.BuildMetadata;]${buildMetadata}"
+
+          echo "##vso[task.setvariable variable=Version.ReleaseMetadata;]rc.${buildMetadata}"
+
+          echo "##vso[task.setvariable variable=Version.ReleaseCandidate;]${branch}-rc.${buildMetadata}"
+
+          echo "Build Number: ${SemVer}-${branch}"
+
+          echo "##vso[build.updatebuildnumber]${SemVer}-${branch}"
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: 'Download: Build Artefacts'
+      inputs:
+        alias: current
+        artifact: deploy
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: 'Download: Test Artefacts'
+      inputs:
+        alias: current
+        artifact: functional-tests
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: Download DevOps Artefacts
+      inputs:
+        alias: current
+        artifact: DevOps
+    - task: Bash@3
+      displayName: 'Install: DevOps Tools'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Bootstrap/install-cicd-prereqs.sh
+        arguments: $(System.DefaultWorkingDirectory)/kustomize https://github.com/kubernetes-sigs/kustomize/releases/download/v2.0.3/kustomize_2.0.3_linux_amd64
+    - task: Bash@3
+      displayName: 'Login: Azure'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/set-azure-context.sh
+        arguments: $(ARM_TENANT_ID) $(ARM_SUBSCRIPTION_ID) $(ARM_CLIENT_ID) $(ARM_CLIENT_SECRET)
+        failOnStderr: true
+    - task: Bash@3
+      displayName: 'Login: Kubernetes'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/set-aks-context.sh
+        arguments: $(Kubernetes.ClusterResourceGroup) $(Kubernetes.ClusterName)
+        failOnStderr: true
+    - task: UniversalPackages@0
+      name: download_az_package
+      displayName: Download AZ 4.7.0
+      inputs:
+        command: download
+        vstsFeed: $(AzureDevOps.Organisation)
+        vstsFeedPackage: pwsh.az.modules
+        vstsPackageVersion: 4.7.0
+        downloadDirectory: $(Agent.TempDirectory)/az
+    - task: PowerShell@2
+      displayName: 'Install: Az'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/install-az-module.ps1
+        arguments: >
+          -localRepository -localModuleDir '$(Agent.TempDirectory)/az'
+        failOnStderr: true
+    - task: PowerShell@2
+      displayName: 'Login: Powershell'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/set-pwsh-az-context.ps1
+        arguments: $(ARM_CLIENT_ID) $(ARM_CLIENT_SECRET) $(ARM_TENANT_ID) $(ARM_SUBSCRIPTION_ID)
+        failOnStderr: true
+    - task: Bash@3
+      displayName: Replace tokens
+      inputs:
+        filePath: $(Pipeline.Workspace)/DevOps/AzureDevOps/replace-tokens.sh
+        arguments: "'$(Pipeline.Workspace)/deploy/helm/premises-api/values.yaml $(Pipeline.Workspace)/deploy/helm/premises-api/Chart.yaml'"
+      env:
+        BUILD_VERSION: $(Version.Semantic)
+        APPLICATION_INSIGHTS_KEY: $(APPLICATION_INSIGHTS_INSTRUMENTATION_KEY)
+        TENANT_ID: $(ARM_TENANT_ID)
+        AZURE_AD_BACKEND_CLIENT_ID: $(azureclientid)
+        DYNAMICSAZUREAD_TOKENENDPOINT: $(DYNAMICSAZUREAD_TOKENENDPOINT)
+        DYNAMICSAZUREAD_RESOURCE: $(DYNAMICSAZUREAD_RESOURCE)
+        DYNAMICSAZUREAD_CLIENTID: $(DYNAMICSAZUREAD_CLIENTID)
+        DYNAMICSAZUREAD_CRMUSERNAME: $(DYNAMICSAZUREAD_CRMUSERNAME)
+        DYNAMICSAZUREAD_CRMPASSWORD: $(DYNAMICSAZUREAD_CRMPASSWORD)
+        DYNAMICS_URL: $(DYNAMICS_URL)
+        DYNAMICSAZUREAD_CACHETIMEINMINUTES: 15
+        PREMISESGATEWAYAPICONFIGURATION_RETRYCOUNT: 1
+        PREMISESGATEWAYAPICONFIGURATION_TIMEOUTSECONDS: 60
+        SEARCH_PRIMARY_KEY: $(SEARCH_PRIMARY_KEY)
+        SEARCH_SERVICE_NAME: $(SEARCH_NAME)
+        LOGLEVEL_DEFAULT: Information
+        LOGLEVEL_DEFAULT_MICROSOFT: Warning
+        API_POD_REPLICA_COUNT: 2
+        DROOLS_ENDPOINT: $(DROOLS_ENDPOINT)
+        DROOLS_PREMISES_RULE: $(DROOLS_PREMISES_RULE)
+        DROOLS_PREMISES_PACKAGENAME: $(DROOLS_PREMISES_PACKAGENAME)
+        DROOLS_BASIC_AUTH_TOKEN: $(DROOLS_BASIC_AUTH_TOKEN)
+    - task: Bash@3
+      displayName: Helm Lint premises-api-$(ENVIRONMENT)
+      inputs:
+        targetType: inline
+        script: >
+          helm lint ./helm/premises-api
+        workingDirectory: $(Pipeline.Workspace)/deploy
+    - task: Bash@3
+      displayName: upgrade/install premises-api-$(ENVIRONMENT)
+      inputs:
+        filePath: $(Pipeline.Workspace)/DevOps/Helm/helm-upgrade-install.sh
+        workingDirectory: $(Pipeline.Workspace)/deploy
+        arguments: >
+          $(Kubernetes.ClusterName) $(ENVIRONMENT)-premises premises-api-$(ENVIRONMENT) helm/premises-api helm/premises-api/values.yaml $(Version.Semantic)
+    - task: Bash@3
+      displayName: 'Kubectl: get deployment properties'
+      inputs:
+        targetType: inline
+        script: >
+          # Check deployment rollout status every 10 seconds (max 5 minutes) until complete.
+
+          ATTEMPTS=0
+
+          ROLLOUT_STATUS_CMD="kubectl rollout status --namespace=$(ENVIRONMENT)-premises deployments/premises-api-$(ENVIRONMENT)"
+
+          until $ROLLOUT_STATUS_CMD || [ $ATTEMPTS -eq 30 ]; do
+            $ROLLOUT_STATUS_CMD
+            ATTEMPTS=$((attempts + 1))
+            sleep 10
+          done
+
+
+          container=$(kubectl get pods --namespace=$(ENVIRONMENT)-premises --selector=release=premises-api-$(ENVIRONMENT),version=$(Version.Semantic) -o jsonpath='{.items[0].metadata.name}')
+
+          echo "container: $container"
+
+          service=$(kubectl get service --namespace=$(ENVIRONMENT)-premises --selector=release=premises-api-$(ENVIRONMENT) -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}')
+
+          echo "Service IP: $service"
+
+          swagger=$(kubectl exec --namespace=$(ENVIRONMENT)-premises ${container} -- curl -s localhost/swagger/all/swagger.json)
+
+          echo $swagger > premises-api-$(ENVIRONMENT)-swagger.json
+
+          echo "--------- swagger -----------"
+
+          cat premises-api-$(ENVIRONMENT)-swagger.json
+
+          echo "--------- swagger -----------"
+
+          echo "##vso[task.setvariable variable=SERVICE_URL]http://${service}"
+        failOnStderr: true
+        workingDirectory: $(Pipeline.Workspace)
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: $(Pipeline.Workspace)/premises-api-$(ENVIRONMENT)-swagger.json
+        artifactName: premises-api-$(ENVIRONMENT)-swagger-$(System.JobAttempt)
+    - task: PowerShell@2
+      displayName: Update APIM API definition - premises-api-$(ENVIRONMENT)
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/import-apim-api.ps1
+        arguments: >
+          -resourceGroupName $(CORE_RESOURCE_GROUP) -serviceName $(APIM_SERVICE_NAME) -apiId premises-api-$(ENVIRONMENT) -apiPath /premises -specificationPath premises-api-$(ENVIRONMENT)-swagger.json
+        workingDirectory: $(Pipeline.Workspace)
+        failOnStderr: true
+    - task: UseDotNet@2
+      displayName: Use .NET Core SDK 3.1.100
+      inputs:
+        packageType: sdk
+        version: 3.1.100
+        installationPath: $(Agent.ToolsDirectory)/dotnet
+    - task: NuGetCommand@2
+      displayName: Authenticate NuGet Packages Feed
+      inputs:
+        command: custom
+        arguments: sources update -Name "Azure DevOps" -Username "vsts" -Password "$(System.AccessToken)" -StorePasswordInClearText -ConfigFile $(Pipeline.Workspace)/functional-tests/Functional/NuGet.config
+        workingDirectory: ''
+    - task: Bash@3
+      displayName: Replace tokens
+      inputs:
+        filePath: $(Pipeline.Workspace)/DevOps/AzureDevOps/replace-tokens.sh
+        arguments: "'$(Pipeline.Workspace)/functional-tests/$(Test.FunctionalTestAppSetingsFile)'"
+      env:
+        BASE_URL: $(APIM_GATEWAY_URL)/premises/
+        OCP_APIM_SUBSCRIPTION_KEY: $(APIM_FULL_ACCESS_PRIMARY_KEY)
+        TENANT_ID: $(ARM_TENANT_ID)
+        AZURE_AD_BACKEND_CLIENT_ID: $(azureclientid)
+        AZURE_AD_CONSUMER_CLIENT_ID: $(WEB_APP_AAD_CLIENT_ID)
+        AZURE_AD_CONSUMER_CLIENT_SECRET: $(WEB_APP_AAD_CLIENT_SECRET)
+        SEARCH_PRIMARY_KEY: $(SEARCH_PRIMARY_KEY)
+        SEARCH_SERVICE_NAME: $(SEARCH_NAME)
+    - task: DotNetCoreCLI@2
+      displayName: 'Test: Run Functional Tests'
+      inputs:
+        command: test
+        projects: $(Pipeline.Workspace)/functional-tests/**/*FunctionalTests.csproj
+        arguments: -v n --filter category=SmokeTest
+        testRunTitle: Functional Tests
+    - task: Bash@3
+      displayName: 'Upload: Test Results'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/upload-azstorage-blob.sh
+        arguments: $(Test.FunctionalTestReportStorageAccountRG) $(Test.FunctionalTestReportSourcePath) $(Test.FunctionalTestReportStorageAccountName) $(Test.FunctionalTestReportStorageContainerName) $(Test.FunctionalTestReportTargetName)
+    - task: Bash@3
+      displayName: 'Retrieve URL: Test Results'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/get-azstorage-sasurl.sh
+        arguments: $(Test.FunctionalTestReportStorageAccountRG) $(Test.FunctionalTestReportStorageAccountName) $(Test.FunctionalTestReportStorageContainerName) $(Test.FunctionalTestReportTargetName)
+- stage: PromoteImageProd
+  dependsOn:
+  - DeployPreprod
+  variables:
+  - group: ergo-subscription-prod
+  - name: SOURCE_ACR_REGISTRY
+    value: pbukspreprodergocrcsub
+  - name: TARGET_ACR_REGISTRY
+    value: pbuksprodergocrcsub
+  jobs:
+  - job: SetSourceVariables
+    dependsOn: []
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+    - group: ergo-subscription-preprod
+    steps:
+    - task: CmdLine@2
+      name: SetupSourceVariables
+      inputs:
+        script: >
+          echo "##vso[task.setvariable variable=SOURCE_TENANT_ID;isOutput=true]$(ARM_TENANT_ID)"
+
+          echo "##vso[task.setvariable variable=SOURCE_SUBSCRIPTION_ID;isOutput=true]$(ARM_SUBSCRIPTION_ID)"
+
+          echo "##vso[task.setvariable variable=SOURCE_CLIENT_ID;isOutput=true]$(ARM_CLIENT_ID)"
+
+          echo "##vso[task.setvariable variable=SOURCE_CLIENT_SECRET;isOutput=true]$(ARM_CLIENT_SECRET)"
+  - job: SetTargetVariables
+    dependsOn: []
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+    - group: ergo-subscription-prod
+    steps:
+    - task: CmdLine@2
+      name: SetupTargetVariables
+      inputs:
+        script: >
+          echo "##vso[task.setvariable variable=TARGET_TENANT_ID;isOutput=true]$(ARM_TENANT_ID)"
+
+          echo "##vso[task.setvariable variable=TARGET_SUBSCRIPTION_ID;isOutput=true]$(ARM_SUBSCRIPTION_ID)"
+
+          echo "##vso[task.setvariable variable=TARGET_CLIENT_ID;isOutput=true]$(ARM_CLIENT_ID)"
+
+          echo "##vso[task.setvariable variable=TARGET_CLIENT_SECRET;isOutput=true]$(ARM_CLIENT_SECRET)"
+  - job: PromoteImages
+    dependsOn:
+    - SetSourceVariables
+    - SetTargetVariables
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+    - name: SOURCE_TENANT_ID
+      value: $[ dependencies.SetSourceVariables.outputs['SetupSourceVariables.SOURCE_TENANT_ID'] ]
+    - name: SOURCE_SUBSCRIPTION_ID
+      value: $[ dependencies.SetSourceVariables.outputs['SetupSourceVariables.SOURCE_SUBSCRIPTION_ID'] ]
+    - name: SOURCE_CLIENT_ID
+      value: $[ dependencies.SetSourceVariables.outputs['SetupSourceVariables.SOURCE_CLIENT_ID'] ]
+    - name: SOURCE_CLIENT_SECRET
+      value: $[ dependencies.SetSourceVariables.outputs['SetupSourceVariables.SOURCE_CLIENT_SECRET'] ]
+    - name: TARGET_TENANT_ID
+      value: $[ dependencies.SetTargetVariables.outputs['SetupTargetVariables.TARGET_TENANT_ID'] ]
+    - name: TARGET_SUBSCRIPTION_ID
+      value: $[ dependencies.SetTargetVariables.outputs['SetupTargetVariables.TARGET_SUBSCRIPTION_ID'] ]
+    - name: TARGET_CLIENT_ID
+      value: $[ dependencies.SetTargetVariables.outputs['SetupTargetVariables.TARGET_CLIENT_ID'] ]
+    - name: TARGET_CLIENT_SECRET
+      value: $[ dependencies.SetTargetVariables.outputs['SetupTargetVariables.TARGET_CLIENT_SECRET'] ]
+    continueOnError: False
+    steps:
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: 'Download: DevOps Artefacts'
+      inputs:
+        alias: current
+        artifact: DevOps
+    - task: Bash@3
+      displayName: 'Promote: Docker Image $(Docker.API.Imagename)'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/promote-acr-image.sh
+        arguments: >
+          $(SOURCE_TENANT_ID) $(SOURCE_SUBSCRIPTION_ID) $(SOURCE_CLIENT_ID) $(SOURCE_CLIENT_SECRET) $(SOURCE_ACR_REGISTRY) $(TARGET_TENANT_ID) $(TARGET_SUBSCRIPTION_ID) $(TARGET_CLIENT_ID) $(TARGET_CLIENT_SECRET) $(TARGET_ACR_REGISTRY) $(Docker.API.Imagename) $(Version.Semantic)
+- stage: DeployProd
+  dependsOn:
+  - PromoteImageProd
+  variables:
+  - group: ergo-subscription-prod
+  - group: core-subscription-prod
+  - group: services-secrets-prod
+  - group: core-prod
+  - group: search-prod
+  - group: drools-prod
+  - name: Kubernetes.ClusterResourceGroup
+    value: pb-uks-prod-ergo-rg-aks
+  - name: Kubernetes.ClusterName
+    value: pb-uks-prod-ergo-aks
+  jobs:
+  - deployment: InitDeploy
+    environment:
+      name: premises_prod
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: Bash@3
+            inputs:
+              targetType: inline
+              script: echo "Checking Azure DevOps environment for approvals..."
+  - job: HelmDeploy
+    dependsOn: []
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: Bash@3
+      displayName: Set Version Variables
+      inputs:
+        targetType: inline
+        script: >
+          commitSHA=$(Build.SourceVersion)
+
+          branch=$(Build.SourceBranchName)
+
+          buildMetadata=$(Build.BuildId).${commitSHA:0:7}
+
+          SemVer=$(Version.Semantic)
+
+          echo "##vso[task.setvariable variable=Version.BuildMetadata;]${buildMetadata}"
+
+          echo "##vso[task.setvariable variable=Version.ReleaseMetadata;]rc.${buildMetadata}"
+
+          echo "##vso[task.setvariable variable=Version.ReleaseCandidate;]${branch}-rc.${buildMetadata}"
+
+          echo "Build Number: ${SemVer}-${branch}"
+
+          echo "##vso[build.updatebuildnumber]${SemVer}-${branch}"
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: 'Download: Build Artefacts'
+      inputs:
+        alias: current
+        artifact: deploy
+    - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+      displayName: Download DevOps Artefacts
+      inputs:
+        alias: current
+        artifact: DevOps
+    - task: Bash@3
+      displayName: 'Install: DevOps Tools'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Bootstrap/install-cicd-prereqs.sh
+        arguments: $(System.DefaultWorkingDirectory)/kustomize https://github.com/kubernetes-sigs/kustomize/releases/download/v2.0.3/kustomize_2.0.3_linux_amd64
+    - task: Bash@3
+      displayName: 'Login: Azure'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/set-azure-context.sh
+        arguments: $(ARM_TENANT_ID) $(ARM_SUBSCRIPTION_ID) $(ARM_CLIENT_ID) $(ARM_CLIENT_SECRET)
+        failOnStderr: true
+    - task: Bash@3
+      displayName: 'Login: Kubernetes'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/set-aks-context.sh
+        arguments: $(Kubernetes.ClusterResourceGroup) $(Kubernetes.ClusterName)
+        failOnStderr: true
+    - task: UniversalPackages@0
+      name: download_az_package
+      displayName: Download AZ 4.7.0
+      inputs:
+        command: download
+        vstsFeed: $(AzureDevOps.Organisation)
+        vstsFeedPackage: pwsh.az.modules
+        vstsPackageVersion: 4.7.0
+        downloadDirectory: $(Agent.TempDirectory)/az
+    - task: PowerShell@2
+      displayName: 'Install: Az'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/install-az-module.ps1
+        arguments: >
+          -localRepository -localModuleDir '$(Agent.TempDirectory)/az'
+        failOnStderr: true
+    - task: PowerShell@2
+      displayName: 'Login: Powershell'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/set-pwsh-az-context.ps1
+        arguments: $(ARM_CLIENT_ID) $(ARM_CLIENT_SECRET) $(ARM_TENANT_ID) $(ARM_SUBSCRIPTION_ID)
+        failOnStderr: true
+    - task: Bash@3
+      displayName: Replace tokens
+      inputs:
+        filePath: $(Pipeline.Workspace)/DevOps/AzureDevOps/replace-tokens.sh
+        arguments: "'$(Pipeline.Workspace)/deploy/helm/premises-api/values.yaml $(Pipeline.Workspace)/deploy/helm/premises-api/Chart.yaml'"
+      env:
+        BUILD_VERSION: $(Version.Semantic)
+        APPLICATION_INSIGHTS_KEY: $(APPLICATION_INSIGHTS_INSTRUMENTATION_KEY)
+        TENANT_ID: $(ARM_TENANT_ID)
+        AZURE_AD_BACKEND_CLIENT_ID: $(azureclientid)
+        DYNAMICSAZUREAD_TOKENENDPOINT: $(DYNAMICSAZUREAD_TOKENENDPOINT)
+        DYNAMICSAZUREAD_RESOURCE: $(DYNAMICSAZUREAD_RESOURCE)
+        DYNAMICSAZUREAD_CLIENTID: $(DYNAMICSAZUREAD_CLIENTID)
+        DYNAMICSAZUREAD_CRMUSERNAME: $(DYNAMICSAZUREAD_CRMUSERNAME)
+        DYNAMICSAZUREAD_CRMPASSWORD: $(DYNAMICSAZUREAD_CRMPASSWORD)
+        DYNAMICS_URL: $(DYNAMICS_URL)
+        DYNAMICSAZUREAD_CACHETIMEINMINUTES: 15
+        PREMISESGATEWAYAPICONFIGURATION_RETRYCOUNT: 1
+        PREMISESGATEWAYAPICONFIGURATION_TIMEOUTSECONDS: 60
+        SEARCH_PRIMARY_KEY: $(SEARCH_PRIMARY_KEY)
+        SEARCH_SERVICE_NAME: $(SEARCH_NAME)
+        LOGLEVEL_DEFAULT: Information
+        LOGLEVEL_DEFAULT_MICROSOFT: Warning
+        API_POD_REPLICA_COUNT: 2
+        DROOLS_ENDPOINT: $(DROOLS_ENDPOINT)
+        DROOLS_PREMISES_RULE: $(DROOLS_PREMISES_RULE)
+        DROOLS_PREMISES_PACKAGENAME: $(DROOLS_PREMISES_PACKAGENAME)
+        DROOLS_BASIC_AUTH_TOKEN: $(DROOLS_BASIC_AUTH_TOKEN)
+    - task: Bash@3
+      displayName: Helm Lint premises-api-$(ENVIRONMENT)
+      inputs:
+        targetType: inline
+        script: >
+          helm lint ./helm/premises-api
+        workingDirectory: $(Pipeline.Workspace)/deploy
+    - task: Bash@3
+      displayName: upgrade/install premises-api-$(ENVIRONMENT)
+      inputs:
+        filePath: $(Pipeline.Workspace)/DevOps/Helm/helm-upgrade-install.sh
+        workingDirectory: $(Pipeline.Workspace)/deploy
+        arguments: >
+          $(Kubernetes.ClusterName) $(ENVIRONMENT)-premises premises-api-$(ENVIRONMENT) helm/premises-api helm/premises-api/values.yaml $(Version.Semantic)
+    - task: Bash@3
+      displayName: 'Kubectl: get deployment properties'
+      inputs:
+        targetType: inline
+        script: >
+          # Check deployment rollout status every 10 seconds (max 5 minutes) until complete.
+
+          ATTEMPTS=0
+
+          ROLLOUT_STATUS_CMD="kubectl rollout status --namespace=$(ENVIRONMENT)-premises deployments/premises-api-$(ENVIRONMENT)"
+
+          until $ROLLOUT_STATUS_CMD || [ $ATTEMPTS -eq 30 ]; do
+            $ROLLOUT_STATUS_CMD
+            ATTEMPTS=$((attempts + 1))
+            sleep 10
+          done
+
+
+          container=$(kubectl get pods --namespace=$(ENVIRONMENT)-premises --selector=release=premises-api-$(ENVIRONMENT),version=$(Version.Semantic) -o jsonpath='{.items[0].metadata.name}')
+
+          echo "container: $container"
+
+          service=$(kubectl get service --namespace=$(ENVIRONMENT)-premises --selector=release=premises-api-$(ENVIRONMENT) -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}')
+
+          echo "Service IP: $service"
+
+          swagger=$(kubectl exec --namespace=$(ENVIRONMENT)-premises ${container} -- curl -s localhost/swagger/all/swagger.json)
+
+          echo $swagger > premises-api-$(ENVIRONMENT)-swagger.json
+
+          echo "--------- swagger -----------"
+
+          cat premises-api-$(ENVIRONMENT)-swagger.json
+
+          echo "--------- swagger -----------"
+
+          echo "##vso[task.setvariable variable=SERVICE_URL]http://${service}"
+        failOnStderr: true
+        workingDirectory: $(Pipeline.Workspace)
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: $(Pipeline.Workspace)/premises-api-$(ENVIRONMENT)-swagger.json
+        artifactName: premises-api-$(ENVIRONMENT)-swagger-$(System.JobAttempt)
+    - task: PowerShell@2
+      displayName: Update APIM API definition - premises-api-$(ENVIRONMENT)
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/import-apim-api.ps1
+        arguments: >
+          -resourceGroupName $(CORE_RESOURCE_GROUP) -serviceName $(APIM_SERVICE_NAME) -apiId premises-api-$(ENVIRONMENT) -apiPath /premises -specificationPath premises-api-$(ENVIRONMENT)-swagger.json
+        workingDirectory: $(Pipeline.Workspace)
+        failOnStderr: true
+    - task: UseDotNet@2
+      displayName: Use .NET Core SDK 3.1.100
+      inputs:
+        packageType: sdk
+        version: 3.1.100
+        installationPath: $(Agent.ToolsDirectory)/dotnet
+    - task: Bash@3
+      displayName: 'Upload: Test Results'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/upload-azstorage-blob.sh
+        arguments: $(Test.FunctionalTestReportStorageAccountRG) $(Test.FunctionalTestReportSourcePath) $(Test.FunctionalTestReportStorageAccountName) $(Test.FunctionalTestReportStorageContainerName) $(Test.FunctionalTestReportTargetName)
+    - task: Bash@3
+      displayName: 'Retrieve URL: Test Results'
+      inputs:
+        targetType: filePath
+        filePath: $(Pipeline.Workspace)/DevOps/Azure/get-azstorage-sasurl.sh
+        arguments: $(Test.FunctionalTestReportStorageAccountRG) $(Test.FunctionalTestReportStorageAccountName) $(Test.FunctionalTestReportStorageContainerName) $(Test.FunctionalTestReportTargetName)
+
